@@ -1,9 +1,8 @@
-from typing import Any
+from typing import Any, Tuple
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
 
@@ -1058,7 +1057,7 @@ class Lattice(AutoSerialize):
     def measure_polarization(
         self,
         measure_ind: int,
-        reference_ind: int,
+        reference_ind: int | list[int],
         reference_radius: float | None = None,
         min_neighbours: int | None = 2,
         max_neighbours: int | None = None,
@@ -1067,21 +1066,23 @@ class Lattice(AutoSerialize):
         **plot_kwargs,
     ) -> "Vector":
         """
-        Measure the polarization of atoms at one site with respect to atoms at another site.
-        Polarization is computed as a fractional displacement (da, db) of each atom in the
-        'measure' site relative to the expected position inferred from the nearest atoms
-        in the 'reference' site and the current lattice vectors. The expected position is
-        the mean of neighbor positions shifted by the lattice vector transform of the
-        fractional index difference.
+        Measure the polarization of atoms at one site with respect to atoms at one or more
+        reference sites.  Polarization is computed as a fractional displacement (da, db) of
+        each atom in the 'measure' site relative to the expected position inferred from the
+        nearest atoms in the reference site(s) and the current lattice vectors.  The expected
+        position is the mean of neighbour positions shifted by the lattice-vector transform of
+        the fractional index difference.
 
         Parameters
         ----------
         measure_ind : int
             Index of the site whose polarization is to be measured.
             This corresponds to the index in `positions_frac` used in `add_atoms()`.
-        reference_ind : int
-            Index of the reference site used to calculate polarization.
-            This corresponds to the index in `positions_frac` used in `add_atoms()`.
+        reference_ind : int | list[int]
+            Index (or list of indices) of the reference site(s) used to calculate polarization.
+            Each index corresponds to a site index in `positions_frac` used in `add_atoms()`.
+            When a list is provided all reference atoms from every listed site are pooled into
+            a single KD-tree, so neighbours can come from any of the reference species.
         reference_radius : float | None, default=None
             If provided, neighbors are selected by radius search (in pixels) using a KD-tree.
             Must be at least 1 pixel. If None, neighbors are selected by k-nearest search.
@@ -1132,23 +1133,37 @@ class Lattice(AutoSerialize):
         Notes
         -----
         - Lattice vectors are taken from `self._lat` and are in pixel units.
+        - When multiple reference indices are provided, all reference atoms are pooled into
+        a single KD-tree.  Neighbour lookup and expected-position calculation are identical
+        to the single-reference case; the fractional index difference between a measured atom
+        and each neighbour is still computed correctly because each reference atom carries its
+        own (a, b) fractional indices regardless of which site it belongs to.
         - Neighbor selection:
             - If `reference_radius` is provided, a radius search (KD-tree) is used and optionally
                 truncated by `max_neighbours`.
             - If `reference_radius` is None, k-nearest neighbors are used with `k=max_neighbours`.
         - The expected position for each measured atom is computed as the mean over selected
-        neighbors of: neighbor_position + L @ ([a - a_i, b - b_i]), where L = [u v], and
-        (a, b) and (a_i, b_i) are the fractional indices of the measured atom and the neighbor,
+        neighbours of: neighbour_position + L @ ([a - a_i, b - b_i]), where L = [u v], and
+        (a, b) and (a_i, b_i) are the fractional indices of the measured atom and the neighbour,
         respectively. The polarization (da, db) is then obtained by transforming the
         Cartesian displacement back to fractional coordinates using L^{-1}.
-        - If either the measure or reference site is empty, an empty Vector (with zero rows) is returned.
+        - If the measure site or all reference sites are empty, an empty Vector (with zero rows)
+        is returned.
         """
         from collections import Counter
 
         from scipy.spatial import cKDTree
 
         measure_ind = int(measure_ind)
-        reference_ind = int(reference_ind)
+
+        # --- Normalise reference_ind to a list of ints ---
+        if isinstance(reference_ind, (int, np.integer)):
+            reference_inds = [int(reference_ind)]
+        else:
+            reference_inds = [int(r) for r in reference_ind]
+
+        if len(reference_inds) == 0:
+            raise ValueError("reference_ind must contain at least one site index.")
 
         def is_empty(cell):
             if cell is None:
@@ -1158,22 +1173,17 @@ class Lattice(AutoSerialize):
             if isinstance(cell, dict):
                 x = cell.get("x", None)
                 return x is None or np.size(x) == 0
-            # Fallback to numpy-like objects
             if hasattr(cell, "size"):
                 return cell.size == 0
             return False
 
-        # Check for empty cells
-        A_cell = self.atoms.get_data(measure_ind)
-        B_cell = self.atoms.get_data(reference_ind)
-        self._pol_meas_ref_ind = (measure_ind, reference_ind)
+        # Store the measure / reference indices used (list form for multi-ref support)
+        self._pol_meas_ref_ind = (measure_ind, reference_inds)
 
         # Prepare a Vector with structured dtype (even for empty data)
         fields = ["x", "y", "a", "b", "da", "db"]
         units = ["px", "px", "ind", "ind", "ind", "ind"]
 
-        # Return an empty Vector object if either cell is empty.
-        # Doing this avoids errors with zero-length Vectors.
         def empty_vector():
             out = Vector.from_shape(
                 shape=(1,),
@@ -1181,23 +1191,47 @@ class Lattice(AutoSerialize):
                 units=units,
                 name="polarization",
             )
-            # Create empty array with shape (0, 6) to match expected format
             empty_data = np.zeros((0, 6), dtype=float)
             out.set_data(empty_data, 0)
             return out
 
-        if is_empty(A_cell) or is_empty(B_cell):
+        # Check measure site
+        A_cell = self.atoms.get_data(measure_ind)
+        if is_empty(A_cell):
             return empty_vector()
 
-        # Extract site data
+        # --- Pool all reference atoms from all requested reference sites ---
+        ref_x_parts, ref_y_parts, ref_a_parts, ref_b_parts = [], [], [], []
+        for rid in reference_inds:
+            B_cell = self.atoms.get_data(rid)
+            if is_empty(B_cell):
+                continue  # Skip empty reference sites (warn below if all empty)
+            bx = self.atoms[rid]["x"]
+            by = self.atoms[rid]["y"]
+            ba = self.atoms[rid]["a"]
+            bb = self.atoms[rid]["b"]
+            if bx.size == 0:
+                continue
+            ref_x_parts.append(bx)
+            ref_y_parts.append(by)
+            ref_a_parts.append(ba)
+            ref_b_parts.append(bb)
+
+        if len(ref_x_parts) == 0:
+            # All reference sites were empty
+            return empty_vector()
+
+        # Concatenate pooled reference arrays
+        Bx = np.concatenate(ref_x_parts)
+        By = np.concatenate(ref_y_parts)
+        Ba = np.concatenate(ref_a_parts)
+        Bb = np.concatenate(ref_b_parts)
+
+        # Extract measure-site data
         Ax = self.atoms[measure_ind]["x"]
         Ay = self.atoms[measure_ind]["y"]
         Aa = self.atoms[measure_ind]["a"]
         Ab = self.atoms[measure_ind]["b"]
-        Bx = self.atoms[reference_ind]["x"]
-        By = self.atoms[reference_ind]["y"]
-        Ba = self.atoms[reference_ind]["a"]
-        Bb = self.atoms[reference_ind]["b"]
 
         if Ax.size == 0 or Bx.size == 0:
             return empty_vector()
@@ -1216,7 +1250,7 @@ class Lattice(AutoSerialize):
         query_coords = np.column_stack([Ax, Ay])
         ref_coords = np.column_stack([Bx, By])
 
-        # Pre-allocate result array memory
+        # Pre-allocate result arrays
         x_arr = Ax.copy().astype(float)
         y_arr = Ay.copy().astype(float)
         a_arr = Aa.copy().astype(float)
@@ -1224,7 +1258,7 @@ class Lattice(AutoSerialize):
         da_arr = np.zeros_like(x_arr, dtype=float)
         db_arr = np.zeros_like(x_arr, dtype=float)
 
-        # KD-tree query
+        # KD-tree built on the pooled reference positions
         tree = cKDTree(ref_coords)
 
         if max_neighbours is None and reference_radius is None:
@@ -1232,7 +1266,7 @@ class Lattice(AutoSerialize):
                 "Either min_neighbours or max_neighbours or reference_radius must be passed."
             )
 
-        # Initialize arrays for results
+        # Initialize lists for neighbour results
         dists = []
         idxs = []
 
@@ -1255,17 +1289,14 @@ class Lattice(AutoSerialize):
                     idxs.append(np.array([]))
                     continue
 
-                # Distance calculation
                 neighbor_coords = ref_coords[neighbors]
                 query_point = query_coords[i]
                 distances = np.linalg.norm(neighbor_coords - query_point, axis=1)
 
-                # Sorting
                 sort_idx = np.argsort(distances)
                 sorted_distances = distances[sort_idx]
                 sorted_indices = np.array(neighbors)[sort_idx]
 
-                # Apply max_neighbours limit if specified
                 if max_neighbours is not None and len(sorted_distances) > max_neighbours:
                     sorted_distances = sorted_distances[:max_neighbours]
                     sorted_indices = sorted_indices[:max_neighbours]
@@ -1273,14 +1304,13 @@ class Lattice(AutoSerialize):
                 dists.append(sorted_distances)
                 idxs.append(sorted_indices)
 
-            # Length checking
             lengths = np.array([len(row) for row in dists])
             if min_neighbours is not None and np.any(lengths < min_neighbours):
                 raise ValueError(
                     "Failed to calculate enough nearest neighbours. Increase the reference_radius"
                 )
 
-        elif reference_radius is None:
+        else:
             # K-nearest neighbors query
             if min_neighbours is None or max_neighbours is None:
                 raise ValueError(
@@ -1299,14 +1329,13 @@ class Lattice(AutoSerialize):
                 workers=-1,
             )
 
-            # Processing of results
             finite_mask = np.isfinite(dist_array)
             for i in range(len(query_coords)):
                 mask = finite_mask[i]
                 dists.append(dist_array[i][mask])
                 idxs.append(idx_array[i][mask])
 
-        # Neighbor checking
+        # Neighbour checking
         lengths = np.array([len(row) for row in dists])
         atoms_with_atleast_one_neighbour = lengths > 0
 
@@ -1328,18 +1357,15 @@ class Lattice(AutoSerialize):
         dc_arr = np.zeros(len(query_coords))
         neighbours_found_idxs = []
 
-        # Calculate displacements with optimizations
+        # Calculate displacements
         for i, (atom_dists, atom_idxs) in enumerate(zip(dists, idxs)):
             if len(atom_idxs) == 0:
-                # Arrays already initialized to 0
                 continue
 
-            # Check if we have enough neighbors
             if min_neighbours is not None and len(atom_idxs) < min_neighbours:
-                # Arrays already initialized to 0
                 continue
 
-            # Determine how many neighbors to use
+            # Determine how many neighbours to use
             num_neighbors_to_use = len(atom_idxs)
             if max_neighbours is not None:
                 num_neighbors_to_use = min(num_neighbors_to_use, max_neighbours)
@@ -1348,7 +1374,6 @@ class Lattice(AutoSerialize):
                     num_neighbors_to_use, min(min_neighbours, len(atom_idxs))
                 )
 
-            # Select the neighbors to use
             if num_neighbors_to_use < len(atom_idxs):
                 closest_order = np.argpartition(atom_dists, num_neighbors_to_use)[
                     :num_neighbors_to_use
@@ -1357,28 +1382,23 @@ class Lattice(AutoSerialize):
             else:
                 nbr_idx = atom_idxs.astype(int)
 
-            # Get actual positions of the atoms
+            # Actual position of the measured atom
             actual_pos = np.array([x_arr[i], y_arr[i]])
 
-            # Calculate the expected positions of the atoms using its n_neighbors
+            # Expected positions using pooled reference atoms
+            # (Ba, Bb, Bx, By are already the concatenated reference arrays)
             a, b = a_arr[i], b_arr[i]
             ai, bi = Ba[nbr_idx], Bb[nbr_idx]
             xi, yi = Bx[nbr_idx], By[nbr_idx]
 
             fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
-            neighbours_found_idxs.append(
-                fractional_diff.T
-            )  # List[i] = np.array(shape = (n_neighbors, 2))
+            neighbours_found_idxs.append(fractional_diff.T)  # (n_neighbors, 2)
             neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
 
             expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
-
-            # Taking the mean of the expected position calculated using each neighbor for better robustness.
             expected_position = np.mean(expected_positions, axis=1)  # (2,)
 
-            # Difference between actual and expected positions gives us polarization.
             displacement_cartesian = actual_pos - expected_position
-
             dr_arr[i] = displacement_cartesian[0]
             dc_arr[i] = displacement_cartesian[1]
 
@@ -1394,7 +1414,6 @@ class Lattice(AutoSerialize):
             name="polarization",
         )
 
-        # Create structured array if needed
         if len(x_arr) > 0:
             arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
         else:
@@ -1402,30 +1421,22 @@ class Lattice(AutoSerialize):
 
         out.set_data(arr, 0)
 
-        # Find the indices of the most common neighbours found.
+        # Find the most common fractional-index neighbour offsets
+        if neighbours_found_idxs:
+            max_neighbours_found = max(len(a) for a in neighbours_found_idxs)
 
-        # Step 1 : Calculate the max number of neighbours found.
-        max_neighbours_found = max(len(arr) for arr in neighbours_found_idxs)
+            pair_bytes = []
+            dtype = neighbours_found_idxs[0].dtype
+            for a in neighbours_found_idxs:
+                for i in range(a.shape[0]):
+                    pair_bytes.append(a[i].tobytes())
 
-        # Step 2: Collect all pairs as bytes
-        pair_bytes = []
-        dtype = neighbours_found_idxs[0].dtype  # Get dtype from first array
-        for arr in neighbours_found_idxs:
-            for i in range(arr.shape[0]):
-                pair_bytes.append(arr[i].tobytes())
-
-        # Step 3: Count frequencies
-        counter = Counter(pair_bytes)
-
-        # Step 4: Get top max_neighbours_found most common
-        top = counter.most_common(max_neighbours_found)
-
-        # Step 5: Convert back to array
-        most_common_neighbours = np.array(
-            [np.frombuffer(pair_b, dtype=dtype) for pair_b, count in top]
-        )
-
-        self.most_common_neighbours = most_common_neighbours
+            counter = Counter(pair_bytes)
+            top = counter.most_common(max_neighbours_found)
+            most_common_neighbours = np.array(
+                [np.frombuffer(pair_b, dtype=dtype) for pair_b, count in top]
+            )
+            self.most_common_neighbours = most_common_neighbours
 
         if plot_polarization_vectors:
             if plot_legend:
@@ -1467,9 +1478,13 @@ class Lattice(AutoSerialize):
         num_phases: int = 2,
         phase_polarization_peak_array: NDArray | None = None,
         refine_means: bool = True,
+        refine_means_direction: bool = True,
+        gmm_covariance_type: str | None = None,
         run_with_restarts: bool = False,
         num_restarts: int = 1,
         verbose: bool = False,
+        spatial_averaging_radius: float | None = None,
+        num_spatial_avg: int = 1,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
         visualize_order_parameter: bool = True,
@@ -1673,6 +1688,8 @@ class Lattice(AutoSerialize):
         from matplotlib.patches import Ellipse
         from scipy.stats import gaussian_kde
 
+        from quantem.imaging.torch_gmm import TorchGMM
+
         # Validate inputs
         if run_with_restarts:
             assert isinstance(num_restarts, int) and num_restarts > 0, (
@@ -1775,45 +1792,6 @@ class Lattice(AutoSerialize):
 
             return None
 
-        class FixedMeansGMM(TorchGMM):
-            """
-            GMM variant with fixed component means.
-            Means are set via fixed_means at init and held constant during EM;
-            only weights and covariances are updated.
-            """
-
-            def __init__(self, fixed_means, **kwargs):
-                fixed_means = np.asarray(fixed_means, dtype=np.float32)
-                super().__init__(n_components=len(fixed_means), means_init=fixed_means, **kwargs)
-                self.fixed_means = fixed_means
-
-            def _m_step(self, X, r):
-                """
-                M-step with fixed means:
-                update mixture weights and covariances from responsibilities,
-                keeping means unchanged.
-                """
-                # Override to keep means fixed while updating weights and covariances
-                N, D = X.shape
-                K = self.n_components
-                Nk = r.sum(dim=0) + 1e-12
-                self._weights = (Nk / (N + 1e-12)).clamp_min(1e-12)
-
-                # Keep means fixed
-                self._means = self._to_tensor(self.fixed_means).clone()
-
-                # Update covariances with fixed means
-                covs = []
-                for k in range(K):
-                    diff = X - self._means[k]
-                    cov_k = (r[:, k][:, None] * diff).T @ diff
-                    cov_k = cov_k / (Nk[k] + 1e-12)
-                    cov_k = cov_k + self.reg_covar * torch.eye(
-                        D, device=self.device, dtype=self.dtype
-                    )
-                    covs.append(cov_k)
-                self._covariances = torch.stack(covs, dim=0)
-
         x_arr = polarization_vectors[0]["x"]
         y_arr = polarization_vectors[0]["y"]
 
@@ -1852,9 +1830,19 @@ class Lattice(AutoSerialize):
             )
             plot_gmm_visualization = False
 
+        # Check covariance type
+        if not gmm_covariance_type or gmm_covariance_type not in [
+            "spherical",
+            "diag",
+            "tied",
+            "full",
+        ]:
+            gmm_covariance_type = "full"
         # Fit GMM with N Gaussians
         if phase_polarization_peak_array is None:
-            gmm = TorchGMM(n_components=num_phases, covariance_type="full", device=torch_device)
+            gmm = TorchGMM(
+                n_components=num_phases, covariance_type=gmm_covariance_type, device=torch_device
+            )
         else:
             # Basic checks
             if phase_polarization_peak_array.shape != (num_phases, 2):
@@ -1862,18 +1850,31 @@ class Lattice(AutoSerialize):
                     f"phase_polarization_peak_array should have dimensions ({num_phases}, 2). You have input : {phase_polarization_peak_array.shape}"
                 )
             if not refine_means:
+                from quantem.imaging.torch_gmm import FixedMeansGMM
+
                 gmm = FixedMeansGMM(
-                    covariance_type="full",
+                    covariance_type=gmm_covariance_type,
                     fixed_means=phase_polarization_peak_array,
+                    device=torch_device,
+                )
+            elif not refine_means_direction:
+                from quantem.imaging.torch_gmm import DirectionalGMM
+
+                gmm = DirectionalGMM(
+                    n_components=num_phases,
+                    covariance_type=gmm_covariance_type,
+                    means_init=phase_polarization_peak_array,
                     device=torch_device,
                 )
             else:
                 gmm = TorchGMM(
                     n_components=num_phases,
-                    covariance_type="full",
+                    covariance_type=gmm_covariance_type,
                     means_init=phase_polarization_peak_array,
                     device=torch_device,
                 )
+
+        self.gmm = gmm
 
         # Intialize best fit tracking variables if run_with_restarts
         if run_with_restarts:
@@ -1936,6 +1937,13 @@ class Lattice(AutoSerialize):
             best_cov = gmm.covariances_
 
         num_components = num_phases
+
+        if spatial_averaging_radius is not None and spatial_averaging_radius > 0:
+            current_fractional = np.column_stack([da_arr, db_arr])  # initialise from raw
+            for i in range(num_spatial_avg):
+                best_probabilities, current_fractional = self._spatial_average_order_parameter(
+                    polarization_vectors, spatial_averaging_radius, current_fractional
+                )
 
         # --- Combined Plot: Scatter overlaid on Contour ---
         if plot_gmm_visualization:
@@ -2321,7 +2329,7 @@ class Lattice(AutoSerialize):
 
             else:
                 # Extract parameters with defaults
-                figsize = kwargs.get("figsize", (10, 8))
+                figsize = kwargs.get("figsize", (12, 12))
                 main_width = kwargs.get("main_width", 10)
 
                 fig = plt.figure(figsize=figsize)
@@ -2461,6 +2469,83 @@ class Lattice(AutoSerialize):
                 fig.tight_layout()
             fig.show()
         return self
+
+    # --- Helper Functions ---
+    def _spatial_average_order_parameter(
+        self,
+        polarization_vectors: Vector,
+        spatial_averaging_radius: float,
+        current_fractional: NDArray,
+    ) -> Tuple[NDArray, NDArray]:
+        """
+        Spatially average the polarization vectors using a Gaussian-distance-weighted
+        mean over a neighbourhood of radius `spatial_averaging_radius` (pixels), then
+        re-classify the averaged vectors using the fitted GMM.
+
+        For each atom i, the averaged Cartesian polarization is:
+
+            p_i_avg = sum_j[ w_ij * p_j ] / sum_j[ w_ij ]
+
+        where the sum runs over all atoms j within `spatial_averaging_radius` pixels
+        of atom i (including i itself), and the Gaussian weight is:
+
+            w_ij = exp( -d_ij^2 / (2 * sigma^2) ),  sigma = spatial_averaging_radius / 2
+
+        The averaged vectors are converted back to fractional coordinates and passed
+        to the fitted GMM to obtain updated per-atom phase probabilities.
+
+        Parameters
+        ----------
+        polarization_vectors : Vector
+            The polarization Vector returned by measure_polarization().
+        spatial_averaging_radius : float
+            Neighbourhood radius in pixels. Atoms within this distance contribute
+            to the weighted average. sigma is set to half this value.
+
+        Returns
+        -------
+        final_probabilities : NDArray, shape (N, num_phases)
+            Updated GMM posterior probabilities after spatial averaging.
+        """
+        from scipy.spatial import cKDTree
+
+        _, u, v = self._lat
+        # L rows are u, v  →  cartesian = fractional @ L
+        L = np.stack([u, v])
+
+        x_arr = polarization_vectors[0]["x"]
+        y_arr = polarization_vectors[0]["y"]
+        cartesian_polarization = current_fractional @ L  # (N, 2)
+
+        # Gaussian sigma is half the averaging radius so that weight drops to
+        # ~0.14 at the boundary and atoms near the centre dominate smoothly.
+        sigma = spatial_averaging_radius / 2.0
+        coords = np.column_stack([x_arr, y_arr])
+        tree = cKDTree(coords)
+
+        averaged_cartesian = np.empty_like(cartesian_polarization)
+
+        for i in range(len(x_arr)):
+            # query_ball_point always includes atom i itself (distance = 0, weight = 1)
+            indices = np.asarray(tree.query_ball_point(coords[i], r=spatial_averaging_radius))
+
+            distances = np.linalg.norm(coords[indices] - coords[i], axis=1)
+            weights = np.exp(-(distances**2) / (2.0 * sigma**2))
+
+            averaged_cartesian[i] = (weights[:, None] * cartesian_polarization[indices]).sum(
+                axis=0
+            ) / weights.sum()
+
+        # Convert averaged Cartesian vectors back to fractional coordinates
+        try:
+            averaged_fractional = averaged_cartesian @ np.linalg.inv(L)
+        except np.linalg.LinAlgError:
+            raise ValueError("Lattice vectors are singular and cannot be inverted.")
+
+        final_probabilities = self.gmm.predict_proba(averaged_fractional)
+        self._order_parameter_probabilities = final_probabilities
+
+        return final_probabilities, averaged_fractional
 
     # --- Plotting Functions ---
     def plot_polarization_vectors(
@@ -3144,7 +3229,7 @@ class Lattice(AutoSerialize):
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
         frac_positions = self._positions_frac
         measure_ind = self._pol_meas_ref_ind[0]
-        reference_ind = self._pol_meas_ref_ind[1]
+        reference_inds = self._pol_meas_ref_ind[1]
         assert phase_vector is not None and phase_vector.shape == (2,), (
             "phase_vector must be of shape (2,)"
         )
@@ -3156,9 +3241,9 @@ class Lattice(AutoSerialize):
         # Get reference, measured, and other atoms
         measured_atom_ind = np.array([[0.0, 0.0]])
         reference_atom_ind = self.most_common_neighbours.copy()
+        indices = np.arange(len(frac_positions))
         other_atom_ind = frac_positions[
-            (np.arange(len(frac_positions)) != measure_ind)
-            & (np.arange(len(frac_positions)) != reference_ind)
+            (indices != measure_ind) & ~np.isin(indices, reference_inds)
         ]
         if other_atom_ind.size > 0:
             other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
@@ -3411,7 +3496,7 @@ class Lattice(AutoSerialize):
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
         frac_positions = self._positions_frac
         measure_ind = self._pol_meas_ref_ind[0]
-        reference_ind = self._pol_meas_ref_ind[1]
+        reference_inds = self._pol_meas_ref_ind[1]
 
         A = np.column_stack((u, v))
         corner_ind = np.array([[i, j] for i in [1.0, 0.0, -1.0] for j in [1.0, 0.0, -1.0]])
@@ -3419,9 +3504,9 @@ class Lattice(AutoSerialize):
         # Get reference, measured, and other atoms
         measured_atom_ind = np.array([[0.0, 0.0]])
         reference_atom_ind = self.most_common_neighbours.copy()
+        indices = np.arange(len(frac_positions))
         other_atom_ind = frac_positions[
-            (np.arange(len(frac_positions)) != measure_ind)
-            & (np.arange(len(frac_positions)) != reference_ind)
+            (indices != measure_ind) & ~np.isin(indices, reference_inds)
         ]
         if other_atom_ind.size > 0:
             other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
@@ -3527,248 +3612,6 @@ class Lattice(AutoSerialize):
         ax.set_title("Atom Positions", fontsize=14, fontweight="bold")
 
         return fig, ax
-
-
-# Implementing GMM using Torch (don't want skimage as a dependency)
-class TorchGMM:
-    """
-    PyTorch Gaussian Mixture Model with full covariances optimized via EM.
-    Only 'full' covariance is supported.
-    Allows custom means initialization, cov regularization, and device/dtype control.
-    After fit, exposes means_, covariances_, and weights_; use predict_proba for responsibilities.
-    """
-
-    def __init__(
-        self,
-        n_components,
-        covariance_type="full",
-        means_init=None,
-        fix_means_mask=None,
-        tol=1e-4,
-        max_iter=200,
-        reg_covar=1e-6,
-        device=None,
-        dtype=torch.float32,
-    ):
-        if covariance_type != "full":
-            raise NotImplementedError("Only 'full' covariance_type is supported as of now.")
-
-        # Store parameters - handle edge cases gracefully
-        self.n_components = int(n_components)
-
-        # Convert negative max_iter to 0 (or absolute value)
-        self.max_iter = abs(int(max_iter))
-
-        self.covariance_type = covariance_type
-        self.means_init = None if means_init is None else np.asarray(means_init, dtype=np.float32)
-        self.fix_means_mask = fix_means_mask
-        self.tol = abs(float(tol))  # Also handle negative tolerance
-        self.reg_covar = float(reg_covar)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = dtype
-
-        # Fitted attributes (NumPy for external access)
-        self.means_ = None
-        self.covariances_ = None
-        self.weights_ = None
-
-        # Internal torch parameters
-        self._means = None  # [K, D]
-        self._covariances = None  # [K, D, D]
-        self._weights = None  # [K]
-
-    def _to_tensor(self, x) -> torch.Tensor:
-        if isinstance(x, np.ndarray):
-            return torch.tensor(x, dtype=self.dtype, device=self.device)
-        elif isinstance(x, torch.Tensor):
-            return x.to(device=self.device, dtype=self.dtype)
-        else:
-            return torch.tensor(x, dtype=self.dtype, device=self.device)
-
-    def _kmeans_plusplus_init(self, X: torch.Tensor, K: int) -> torch.Tensor:
-        """Initialize means using k-means++ algorithm for better spread."""
-        N, D = X.shape
-
-        # Work on CPU for deterministic behavior
-        X_cpu = X.cpu()
-
-        # First center: random choice
-        indices = [torch.randint(0, N, (1,), device="cpu").item()]
-
-        # Remaining centers: choose based on distance to existing centers
-        for _ in range(1, K):
-            # Compute distances to nearest existing center
-            centers = X_cpu[indices]
-            dists = torch.cdist(X_cpu, centers)  # [N, num_centers]
-            min_dists = dists.min(dim=1)[0]  # [N]
-
-            # Square distances for probability weighting
-            probs = min_dists**2
-            probs_sum = probs.sum()
-
-            # Handle case where all points are identical (probs_sum == 0)
-            if probs_sum > 1e-10:
-                probs = probs / probs_sum
-                # Sample next center
-                next_idx = torch.multinomial(probs, 1).item()
-            else:
-                # All points are very close, just pick randomly
-                next_idx = torch.randint(0, N, (1,), device="cpu").item()
-
-            indices.append(next_idx)
-
-        return X_cpu[indices].to(device=self.device, dtype=self.dtype)
-
-    def _init_params(self, X: torch.Tensor) -> None:
-        N, D = X.shape
-        K = self.n_components
-
-        if self.means_init is not None:
-            if self.means_init.shape != (K, D):
-                raise ValueError(
-                    f"means_init must have shape ({K}, {D}), got {self.means_init.shape}"
-                )
-            self._means = self._to_tensor(self.means_init).clone()
-        else:
-            # Initialize means using k-means++ for better separation
-            if N > 0 and K > 0:
-                if N >= K:
-                    self._means = self._kmeans_plusplus_init(X, K)
-                else:
-                    # Sample with replacement if not enough samples
-                    X_cpu = X.cpu()
-                    indices = torch.randint(0, N, (K,), device="cpu")
-                    self._means = X_cpu[indices].clone().to(device=self.device, dtype=self.dtype)
-            else:
-                self._means = torch.zeros((K, D), device=self.device, dtype=self.dtype)
-
-        # Initialize covariances with global covariance for stability
-        if N > 1:
-            X_centered = X - X.mean(dim=0, keepdim=True)
-            global_cov = (X_centered.T @ X_centered) / (N - 1)
-            # Add strong regularization for near-singular cases
-            global_cov = global_cov + self.reg_covar * torch.eye(
-                D, device=self.device, dtype=self.dtype
-            )
-        else:
-            global_cov = self.reg_covar * torch.eye(D, device=self.device, dtype=self.dtype)
-
-        # Ensure minimum eigenvalue for numerical stability
-        eigenvalues = torch.linalg.eigvalsh(global_cov)
-        if eigenvalues.min() < self.reg_covar:
-            global_cov = global_cov + (self.reg_covar - eigenvalues.min() + 1e-6) * torch.eye(
-                D, device=self.device, dtype=self.dtype
-            )
-
-        self._covariances = global_cov.unsqueeze(0).repeat(K, 1, 1).clone()
-
-        # Initialize weights uniformly - handle K=0 case
-        self._weights = torch.full(
-            (K,), 1.0 / K if K > 0 else 1.0, device=self.device, dtype=self.dtype
-        )
-
-    def _log_gaussians(self, X: torch.Tensor) -> torch.Tensor:
-        # X: [N, D], means: [K, D], covs: [K, D, D]
-        N, D = X.shape
-        K = self.n_components
-
-        # Compute log probabilities for each component
-        log_probs = []
-        for k in range(K):
-            # Ensure covariance is positive definite
-            cov_k = self._covariances[k]
-
-            # Check if covariance needs additional regularization
-            try:
-                # Try with current covariance
-                dist = torch.distributions.MultivariateNormal(
-                    loc=self._means[k], covariance_matrix=cov_k, validate_args=False
-                )
-                log_prob = dist.log_prob(X)
-            except (RuntimeError, ValueError):
-                # Add stronger regularization if needed
-                cov_reg = cov_k + 1e-3 * torch.eye(D, device=self.device, dtype=self.dtype)
-                dist = torch.distributions.MultivariateNormal(
-                    loc=self._means[k], covariance_matrix=cov_reg, validate_args=False
-                )
-                log_prob = dist.log_prob(X)
-
-            log_probs.append(log_prob)  # [N]
-
-        log_comp = torch.stack(log_probs, dim=1)  # [N, K]
-        return log_comp
-
-    def _e_step(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        log_comp = self._log_gaussians(X)  # [N, K]
-        log_weights = torch.log(self._weights.clamp_min(1e-12))  # [K]
-        log_post = log_comp + log_weights[None, :]  # [N, K]
-        r = torch.softmax(log_post, dim=1)  # responsibilities [N, K]
-        return r, log_post
-
-    def _m_step(self, X: torch.Tensor, r: torch.Tensor) -> None:
-        N, D = X.shape
-        K = self.n_components
-        Nk = r.sum(dim=0).clamp_min(1e-12)  # [K]
-        self._weights = (Nk / N).clamp_min(1e-12)
-
-        # Means
-        self._means = (r.T @ X) / Nk[:, None]
-
-        # Covariances (full)
-        covs = []
-        for k in range(K):
-            diff = X - self._means[k]  # [N, D]
-            cov_k = (r[:, k][:, None] * diff).T @ diff
-            cov_k = cov_k / Nk[k]
-
-            # Add regularization
-            cov_k = cov_k + self.reg_covar * torch.eye(D, device=self.device, dtype=self.dtype)
-
-            # Ensure positive definiteness
-            eigenvalues = torch.linalg.eigvalsh(cov_k)
-            if eigenvalues.min() < self.reg_covar:
-                cov_k = cov_k + (self.reg_covar - eigenvalues.min() + 1e-6) * torch.eye(
-                    D, device=self.device, dtype=self.dtype
-                )
-
-            covs.append(cov_k)
-        self._covariances = torch.stack(covs, dim=0)  # [K, D, D]
-
-    def fit(self, data) -> "TorchGMM":
-        X = self._to_tensor(data)
-        if X.ndim != 2:
-            raise ValueError("Input data must be 2D with shape (N, D)")
-
-        self._init_params(X)
-
-        prev_ll = torch.tensor(float("-inf"), device=self.device, dtype=self.dtype)
-
-        for iteration in range(self.max_iter):
-            r, _ = self._e_step(X)
-            self._m_step(X, r)
-
-            # Compute average log-likelihood of data under mixture
-            log_comp = self._log_gaussians(X)
-            log_weighted = log_comp + torch.log(self._weights)[None, :]
-            ll = torch.logsumexp(log_weighted, dim=1).mean()
-
-            # Check convergence
-            if iteration > 0 and torch.isfinite(prev_ll) and torch.isfinite(ll):
-                improvement = (ll - prev_ll).abs()
-                if improvement < self.tol:
-                    break
-            prev_ll = ll
-
-        # Store NumPy copies for external use (decoupled from internal tensors)
-        self.means_ = self._means.detach().clone().cpu().numpy()
-        self.covariances_ = self._covariances.detach().clone().cpu().numpy()
-        self.weights_ = self._weights.detach().clone().cpu().numpy()
-        return self
-
-    def predict_proba(self, data) -> np.ndarray:
-        X = self._to_tensor(data)
-        r, _ = self._e_step(X)
-        return r.detach().cpu().numpy()
 
 
 # helper functions for plotting
