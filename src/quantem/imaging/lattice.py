@@ -1483,11 +1483,7 @@ class Lattice(AutoSerialize):
         run_with_restarts: bool = False,
         num_restarts: int = 1,
         verbose: bool = False,
-        spatial_averaging_radius: float | None = None,
-        num_spatial_avg: int = 1,
-        sigma_similarity: float | None = None,
-        outlier_removal_radius: float | None = None,
-        num_outlier_removal: int = 1,
+        spatial_averaging_sigma: float | None = None,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
         visualize_order_parameter: bool = True,
@@ -1544,6 +1540,14 @@ class Lattice(AutoSerialize):
             If True, prints diagnostic information including fitted means and error
             metrics for each restart.
 
+        spatial_averaging_sigma : float | None, default=None
+            If provided, applies post-GMM Gaussian spatial averaging of polarization
+            vectors. The neighbourhood radius is set to 3 * sigma so that the Gaussian
+            weight at the boundary is exp(-4.5) ~ 0.011, effectively zero.
+            Atoms within this radius are averaged using a combined weight:
+                w_ij = exp(-d_ij^2 / (2*sigma^2))
+            If None, no spatial averaging is performed.
+
         plot_order_parameter : bool, default=True
             If True, overlays sites on self._image.array and colors them by their full
             mixture probability distribution:
@@ -1580,19 +1584,19 @@ class Lattice(AutoSerialize):
 
             gmm_center_colour : color specification, optional
                 Color for GMM center markers; invalid values fall back to a preset with a warning.
-                Presets depend on num_phases (2: lime; 3-4: Yellow; ≥5: Black).
+                Presets depend on num_phases (2: lime; 3-4: Yellow; >=5: Black).
 
             gmm_ellipse_colour : color specification, optional
                 Color for GMM covariance ellipses; invalid values fall back to a preset with a warning.
-                Presets depend on num_phases (2: lime; 3-4: Yellow; ≥5: White).
+                Presets depend on num_phases (2: lime; 3-4: Yellow; >=5: White).
 
             scatter_colours : callable, array, or list, optional
                 Colors used to map phase probabilities for scatter points
                 (and the order-parameter map). Accepted forms:
-                    • callable f(i) -> RGB(A) (first 3 components used),
-                    • numpy array of shape (num_phases, 3) with RGB in [0, 1],
-                    • list/tuple of valid color names/values of length num_phases,
-                    • single valid color (applied to all phases; prints a warning).
+                    - callable f(i) -> RGB(A) (first 3 components used),
+                    - numpy array of shape (num_phases, 3) with RGB in [0, 1],
+                    - list/tuple of valid color names/values of length num_phases,
+                    - single valid color (applied to all phases; prints a warning).
                 Invalid inputs fall back to a preset (site_colors) with a warning.
                 When plot_order_parameter=True,
                 scatter_colours is used to color points by phase probabilities.
@@ -1941,24 +1945,17 @@ class Lattice(AutoSerialize):
 
         num_components = num_phases
 
-        if spatial_averaging_radius is not None and spatial_averaging_radius > 0:
-            # Initialise from the original raw (da, db) vectors. Each iteration
-            # passes the averaged output of the previous call as input, so the
-            # smoothing genuinely accumulates rather than re-averaging raw data.
+        # --- Post-GMM spatial averaging ---
+        # Radius is fixed at 3*sigma so the Gaussian weight at the boundary
+        # is exp(-4.5) ~ 0.011, effectively zero — no hard edge artefacts.
+        current_fractional = None
+        if spatial_averaging_sigma is not None and spatial_averaging_sigma > 0:
             current_fractional = np.column_stack([da_arr, db_arr])
-            for i in range(num_spatial_avg):
-                best_probabilities, current_fractional = self._spatial_average_order_parameter(
-                    polarization_vectors,
-                    spatial_averaging_radius,
-                    current_fractional,
-                    sigma_similarity=sigma_similarity,
-                )
-
-        if outlier_removal_radius is not None and outlier_removal_radius > 0:
-            for i in range(num_outlier_removal):
-                best_probabilities = self._remove_outliers(
-                    polarization_vectors, outlier_removal_radius
-                )
+            best_probabilities, current_fractional = self._spatial_average_order_parameter(
+                polarization_vectors,
+                spatial_averaging_sigma,
+                current_fractional,
+            )
 
         # --- Combined Plot: Scatter overlaid on Contour ---
         if plot_gmm_visualization:
@@ -2058,13 +2055,17 @@ class Lattice(AutoSerialize):
             ax.contourf(X, Y, Z, levels=15, cmap=contour_cmap, alpha=0.9)
             ax.contour(X, Y, Z, levels=15, cmap=contour_cmap, linewidths=0.5, alpha=0.9)
 
-            # Second: Overlay scatter points with classification colors
+            # Second: Overlay scatter points with classification colors.
+            # If spatial averaging was applied, plot the averaged vectors so the
+            # scatter positions match what the GMM was re-scored against.
             point_colors = create_colors_from_probabilities(
                 best_probabilities, num_components, scatter_colours
             )
+            scatter_da = current_fractional[:, 0] if current_fractional is not None else da_arr
+            scatter_db = current_fractional[:, 1] if current_fractional is not None else db_arr
             ax.scatter(
-                da_arr,
-                db_arr,
+                scatter_da,
+                scatter_db,
                 c=point_colors,
                 alpha=0.7,
                 s=20,
@@ -2489,47 +2490,37 @@ class Lattice(AutoSerialize):
     def _spatial_average_order_parameter(
         self,
         polarization_vectors: "Vector",
-        spatial_averaging_radius: float,
+        spatial_averaging_sigma: float,
         current_fractional: "NDArray",
-        sigma_similarity: float | None = None,
     ) -> "tuple[NDArray, NDArray]":
         """
-        Spatially average polarization vectors using a bilateral filter, then
-        re-classify the averaged vectors using the fitted GMM.
+        Spatially average polarization vectors using a Gaussian distance-weighted
+        mean, then re-classify the averaged vectors using the fitted GMM.
 
-        Each atom i is averaged over its neighbourhood using a combined weight:
+        For each atom i the averaged Cartesian polarization is:
 
-            w_ij = w_dist_ij * w_sim_ij
+            p_i_avg = sum_j[ w_ij * p_j ] / sum_j[ w_ij ]
 
-        where:
-            w_dist_ij = exp( -d_ij^2 / (2 * sigma_dist^2) )
-                spatial Gaussian; sigma_dist = spatial_averaging_radius / 2
+        where the Gaussian weight is:
 
-            w_sim_ij  = exp( -|p_i - p_j|^2 / (2 * sigma_sim^2) )
-                polarization similarity Gaussian; preserves domain boundaries
-                by down-weighting neighbours whose polarization vector differs
-                significantly from atom i's own vector.
+            w_ij = exp( -d_ij^2 / (2 * sigma^2) )
 
-        sigma_sim is auto-computed from the minimum pairwise distance between
-        GMM means if not supplied, giving a scale that adapts to the actual
-        phase separation in the dataset.
+        The neighbourhood search radius is fixed at 3 * sigma so that the
+        Gaussian weight at the boundary is exp(-4.5) ~ 0.011, effectively zero,
+        eliminating hard edge artefacts without requiring a separate radius
+        parameter.
+
 
         Parameters
         ----------
         polarization_vectors : Vector
             Only the pixel positions (x, y) are read from here.
-        spatial_averaging_radius : float
-            Neighbourhood radius in pixels. sigma_dist = radius / 2.
+        spatial_averaging_sigma : float
+            Gaussian sigma in pixels. The search radius is 3 * sigma.
         current_fractional : NDArray, shape (N, 2)
             Current fractional polarization (da, db). Pass raw vectors on the
             first call and the returned averaged_fractional on each subsequent
             call so that smoothing accumulates across iterations.
-        sigma_similarity : float | None, default None
-            Width of the polarization-similarity Gaussian in Cartesian pixel
-            units. If None, auto-computed as half the minimum pairwise distance
-            between GMM component means, which places the inflection point of
-            the similarity kernel midway between adjacent phase clusters.
-
         Returns
         -------
         final_probabilities : NDArray, shape (N, num_phases)
@@ -2546,25 +2537,9 @@ class Lattice(AutoSerialize):
 
         cartesian_polarization = current_fractional @ L  # (N, 2)
 
-        # --- Spatial sigma ---
-        sigma_dist = spatial_averaging_radius / 2.0
-
-        # --- Similarity sigma ---
-        # Auto-compute from minimum inter-mean distance in Cartesian space so
-        # the kernel naturally adapts to the phase separation in each dataset.
-        if sigma_similarity is None:
-            means_cart = self._polarization_means @ L  # (K, 2)
-            K = means_cart.shape[0]
-            if K >= 2:
-                diffs = means_cart[:, None, :] - means_cart[None, :, :]  # (K,K,2)
-                pairwise = np.linalg.norm(diffs, axis=2)  # (K,K)
-                np.fill_diagonal(pairwise, np.inf)
-                sigma_sim = float(pairwise.min()) / 2.0
-            else:
-                # Single phase — similarity weight is uniform (all neighbours included)
-                sigma_sim = np.inf
-        else:
-            sigma_sim = float(sigma_similarity)
+        sigma = float(spatial_averaging_sigma)
+        # Radius is 3*sigma: Gaussian weight at boundary ~ exp(-4.5) ~ 0.011
+        radius = 3.0 * sigma
 
         coords = np.column_stack([x_arr, y_arr])
         tree = cKDTree(coords)
@@ -2572,24 +2547,10 @@ class Lattice(AutoSerialize):
         averaged_cartesian = np.empty_like(cartesian_polarization)
 
         for i in range(len(x_arr)):
-            indices = np.asarray(tree.query_ball_point(coords[i], r=spatial_averaging_radius))
+            indices = np.asarray(tree.query_ball_point(coords[i], r=radius))
 
-            # Spatial Gaussian weight
             distances = np.linalg.norm(coords[indices] - coords[i], axis=1)
-            w_dist = np.exp(-(distances**2) / (2.0 * sigma_dist**2))
-
-            # Polarization similarity weight — down-weights neighbours whose
-            # polarization vector differs strongly from atom i's own vector,
-            # preserving domain boundaries regardless of the number of phases.
-            pol_diff = np.linalg.norm(
-                cartesian_polarization[indices] - cartesian_polarization[i], axis=1
-            )
-            if np.isfinite(sigma_sim) and sigma_sim > 0:
-                w_sim = np.exp(-(pol_diff**2) / (2.0 * sigma_sim**2))
-            else:
-                w_sim = np.ones(len(indices))
-
-            weights = w_dist * w_sim
+            weights = np.exp(-(distances**2) / (2.0 * sigma**2))
 
             averaged_cartesian[i] = (weights[:, None] * cartesian_polarization[indices]).sum(
                 axis=0
@@ -2604,98 +2565,6 @@ class Lattice(AutoSerialize):
         self._order_parameter_probabilities = final_probabilities
 
         return final_probabilities, averaged_fractional
-
-    def _remove_outliers(
-        self,
-        polarization_vectors: "Vector",
-        outlier_removal_radius: float,
-    ) -> "NDArray":
-        """
-        Correct isolated misclassified atoms by replacing each atom's phase
-        probabilities with the distance-weighted mean of its neighbours'
-        probabilities whenever the atom's hard assignment (argmax) disagrees
-        with the neighbourhood majority.
-
-        This operates entirely on the current probability array
-        (self._order_parameter_probabilities) and does not touch the
-        polarization vectors. It is therefore safe to run after spatial
-        averaging, or instead of it when the vectors are trustworthy but
-        the classification has isolated flip errors.
-
-        Algorithm
-        ---------
-        For each atom i:
-          1. Find all atoms j within outlier_removal_radius pixels.
-          2. Compute the hard assignment (argmax) for each neighbour j.
-          3. Identify the majority phase among those neighbours.
-          4. If atom i's hard assignment disagrees with the majority,
-             replace its probability row with the distance-weighted mean
-             of its neighbours' probability rows, then L1-normalise.
-             Atoms whose hard assignment already matches the majority are
-             left untouched, so bulk domain atoms are never modified.
-
-        Parameters
-        ----------
-        polarization_vectors : Vector
-            Used only to read pixel positions (x, y).
-        outlier_removal_radius : float
-            Neighbourhood search radius in pixels. Should be set to
-            roughly 1-2 lattice spacings so only immediate neighbours
-            are consulted -- large values will start smoothing domain
-            boundaries rather than removing point outliers.
-
-        Returns
-        -------
-        updated_probabilities : NDArray, shape (N, num_phases)
-            Corrected probability array. Also written to
-            self._order_parameter_probabilities.
-        """
-        from scipy.spatial import cKDTree
-
-        x_arr = polarization_vectors[0]["x"]
-        y_arr = polarization_vectors[0]["y"]
-
-        probs = self._order_parameter_probabilities.copy()  # (N, K)
-        hard = np.argmax(probs, axis=1)  # (N,)
-
-        coords = np.column_stack([x_arr, y_arr])
-        sigma = outlier_removal_radius / 2.0
-        tree = cKDTree(coords)
-
-        updated = probs.copy()
-
-        for i in range(len(x_arr)):
-            indices = np.asarray(tree.query_ball_point(coords[i], r=outlier_removal_radius))
-
-            # Exclude the atom itself from the neighbourhood vote so the
-            # majority is determined purely by surrounding atoms.
-            neighbour_idx = indices[indices != i]
-            if len(neighbour_idx) == 0:
-                continue
-
-            neighbour_phases = hard[neighbour_idx]
-
-            # Majority phase among neighbours (ties broken by argmax of mean probs)
-            phase_counts = np.bincount(neighbour_phases, minlength=probs.shape[1])
-            majority_phase = int(np.argmax(phase_counts))
-
-            # Only correct atoms that disagree with the neighbourhood majority
-            if hard[i] == majority_phase:
-                continue
-
-            # Replace with distance-weighted mean of all neighbours' probabilities.
-            # Using all neighbours (not just the majority phase) gives a soft
-            # correction that reflects genuine uncertainty at boundaries rather
-            # than a hard flip.
-            distances = np.linalg.norm(coords[neighbour_idx] - coords[i], axis=1)
-            weights = np.exp(-(distances**2) / (2.0 * sigma**2))
-
-            weighted_probs = (weights[:, None] * probs[neighbour_idx]).sum(axis=0)
-            weighted_probs /= weighted_probs.sum()  # L1-normalise to valid probability row
-            updated[i] = weighted_probs
-
-        self._order_parameter_probabilities = updated
-        return updated
 
     # --- Plotting Functions ---
     def plot_polarization_vectors(
