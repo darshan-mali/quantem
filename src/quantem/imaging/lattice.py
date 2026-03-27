@@ -1057,8 +1057,9 @@ class Lattice(AutoSerialize):
     def measure_polarization(
         self,
         measure_ind: int,
-        reference_ind: int | list[int],
-        reference_radius: float | None = None,
+        reference_ind: int | list[int] | None = None,
+        reference_sigma: float | None = None,
+        sigma_units: str = "pixels",
         min_neighbours: int | None = 2,
         max_neighbours: int | None = None,
         plot_polarization_vectors: bool = False,
@@ -1066,31 +1067,50 @@ class Lattice(AutoSerialize):
         **plot_kwargs,
     ) -> "Vector":
         """
-        Measure the polarization of atoms at one site with respect to atoms at one or more
-        reference sites.  Polarization is computed as a fractional displacement (da, db) of
-        each atom in the 'measure' site relative to the expected position inferred from the
-        nearest atoms in the reference site(s) and the current lattice vectors.  The expected
-        position is the mean of neighbour positions shifted by the lattice-vector transform of
-        the fractional index difference.
+        Measure the polarization of atoms at one site with respect to atoms at another site.
+        Polarization is computed as a fractional displacement (da, db) of each atom in the
+        'measure' site relative to the expected position inferred from the nearest atoms
+        in the 'reference' site and the current lattice vectors.
+
+        The expected position is a distance-weighted average of each neighbour's predicted
+        position (neighbour_position + L @ fractional_index_diff).  When `reference_sigma`
+        is provided, Gaussian weights w_i = exp(-d_i² / (2 σ²)) are used and the search
+        radius is set to 3 σ.  When k-nearest search is used instead, inverse-distance
+        weights w_i = 1 / (d_i + ε) are applied.
 
         Parameters
         ----------
         measure_ind : int
             Index of the site whose polarization is to be measured.
             This corresponds to the index in `positions_frac` used in `add_atoms()`.
-        reference_ind : int | list[int]
-            Index (or list of indices) of the reference site(s) used to calculate polarization.
-            Each index corresponds to a site index in `positions_frac` used in `add_atoms()`.
-            When a list is provided all reference atoms from every listed site are pooled into
-            a single KD-tree, so neighbours can come from any of the reference species.
-        reference_radius : float | None, default=None
-            If provided, neighbors are selected by radius search (in pixels) using a KD-tree.
-            Must be at least 1 pixel. If None, neighbors are selected by k-nearest search.
+        reference_ind : int | list[int] | None, default=None
+            Index (or list of indices) of the reference site(s) used to calculate
+            polarization.  Each index corresponds to a site in `positions_frac` used in
+            ``add_atoms()``.  When a list is provided, all reference atoms from every
+            listed site are pooled into a single KD-tree.  If ``None``, all sites other
+            than ``measure_ind`` are used automatically (requires ``self._num_sites`` to
+            be set).
+        reference_sigma : float | None, default=None
+            If provided, a Gaussian-weighted radius search is used.  The search radius is
+            set to ``3 * reference_sigma`` and each neighbour's contribution is weighted by
+            ``exp(-d² / (2 * reference_sigma²))``.  The units of this value are controlled
+            by ``sigma_units``.  Must be at least 1 pixel after conversion.  If None,
+            k-nearest search is used instead (see `max_neighbours`).
+        sigma_units : str, default="pixels"
+            Units in which ``reference_sigma`` is expressed.  Accepted values:
+
+            - ``"pixels"``    — sigma is in pixel units; the KD-tree is built in pixel
+              space.
+            - ``"unit_cell"`` — sigma is expressed as a number of unit cells; the KD-tree
+              is built in fractional (a, b) coordinate space, where a distance of 1
+              equals exactly 1 unit cell.  The stored fractional indices on each atom are
+              used directly — no lattice-vector approximation is needed.
         min_neighbours : int | None, default=2
-            Minimum number of nearest neighbors used to calculate polarization. Must be >= 2
-            when using k-nearest search (i.e., when `reference_radius` is None).
+            Minimum number of nearest neighbors required. Must be >= 2 when using k-nearest
+            search (i.e., when `reference_sigma` is None).
         max_neighbours : int | None, default=None
-            Maximum number of nearest neighbors to use. Required when `reference_radius` is None.
+            Maximum number of nearest neighbors to use. Required when `reference_sigma` is
+            None (k-nearest mode).  Ignored when `reference_sigma` is provided.
         plot_polarization_vectors : bool, default=False
             If True, plots the polarization vectors using `self.plot_polarization_vectors(...)`.
         **plot_kwargs : optional
@@ -1120,35 +1140,39 @@ class Lattice(AutoSerialize):
         ------
         ValueError
             - If the lattice vectors are singular (cannot invert).
-            - If neither `reference_radius` nor both `min_neighbours` and `max_neighbours` are specified.
-            - If `reference_radius` < 1.
-            - If radius-based search fails to find at least `min_neighbours` for any atom.
+            - If neither `reference_sigma` nor both `min_neighbours` and `max_neighbours`
+              are specified.
+            - If `reference_sigma` <= 0 (unit_cell mode) or < 1 (pixels mode).
+            - If sigma-based search fails to find at least `min_neighbours` for any atom.
             - If k-nearest search is used and `min_neighbours` or `max_neighbours` is missing.
             - If k-nearest search is used with `min_neighbours` < 2 or `max_neighbours` < 2.
             - If `min_neighbours` > `max_neighbours`.
-            - If no atoms have any neighbors identified (increase `reference_radius`).
+            - If no atoms have any neighbors identified (increase `reference_sigma`).
         Warning
-            If some atoms do not have any neighbors identified (suggests increasing `reference_radius`).
+            If some atoms do not have any neighbors identified (suggests increasing
+            `reference_sigma`).
 
         Notes
         -----
         - Lattice vectors are taken from `self._lat` and are in pixel units.
-        - When multiple reference indices are provided, all reference atoms are pooled into
-        a single KD-tree.  Neighbour lookup and expected-position calculation are identical
-        to the single-reference case; the fractional index difference between a measured atom
-        and each neighbour is still computed correctly because each reference atom carries its
-        own (a, b) fractional indices regardless of which site it belongs to.
         - Neighbor selection:
-            - If `reference_radius` is provided, a radius search (KD-tree) is used and optionally
-                truncated by `max_neighbours`.
-            - If `reference_radius` is None, k-nearest neighbors are used with `k=max_neighbours`.
-        - The expected position for each measured atom is computed as the mean over selected
-        neighbours of: neighbour_position + L @ ([a - a_i, b - b_i]), where L = [u v], and
-        (a, b) and (a_i, b_i) are the fractional indices of the measured atom and the neighbour,
-        respectively. The polarization (da, db) is then obtained by transforming the
-        Cartesian displacement back to fractional coordinates using L^{-1}.
-        - If the measure site or all reference sites are empty, an empty Vector (with zero rows)
-        is returned.
+            - If `reference_sigma` is provided, a radius search with cutoff
+              ``3 * reference_sigma`` is used (KD-tree). ``max_neighbours`` is ignored
+              in this mode.
+            - If `reference_sigma` is None, k-nearest neighbors are used with
+              ``k = max_neighbours``.
+        - When ``sigma_units == "unit_cell"``, the KD-tree is built in fractional (a, b)
+          space so that ``reference_sigma = 1`` selects neighbours within 1 unit cell.
+          The displacement calculation remains in pixel space.
+        - The expected position for each measured atom is the distance-weighted average
+          over selected neighbours of: neighbour_position + L @ ([a - a_i, b - b_i]),
+          where L = [u v] and (a, b) / (a_i, b_i) are fractional indices of the measured
+          atom and each neighbour respectively.  Gaussian weights are used when
+          `reference_sigma` is provided; inverse-distance weights otherwise.
+          The polarization (da, db) is obtained by transforming the Cartesian displacement
+          back to fractional coordinates via L^{-1}.
+        - If either the measure or reference site is empty, an empty Vector (with zero rows)
+          is returned.
         """
         from collections import Counter
 
@@ -1157,7 +1181,10 @@ class Lattice(AutoSerialize):
         measure_ind = int(measure_ind)
 
         # --- Normalise reference_ind to a list of ints ---
-        if isinstance(reference_ind, (int, np.integer)):
+        if reference_ind is None:
+            # Use all sites except the measure site
+            reference_inds = [i for i in range(int(self._num_sites)) if i != measure_ind]
+        elif isinstance(reference_ind, (int, np.integer)):
             reference_inds = [int(reference_ind)]
         else:
             reference_inds = [int(r) for r in reference_ind]
@@ -1173,11 +1200,12 @@ class Lattice(AutoSerialize):
             if isinstance(cell, dict):
                 x = cell.get("x", None)
                 return x is None or np.size(x) == 0
+            # Fallback to numpy-like objects
             if hasattr(cell, "size"):
                 return cell.size == 0
             return False
 
-        # Store the measure / reference indices used (list form for multi-ref support)
+        # Store the measure / reference indices used
         self._pol_meas_ref_ind = (measure_ind, reference_inds)
 
         # Prepare a Vector with structured dtype (even for empty data)
@@ -1205,7 +1233,7 @@ class Lattice(AutoSerialize):
         for rid in reference_inds:
             B_cell = self.atoms.get_data(rid)
             if is_empty(B_cell):
-                continue  # Skip empty reference sites (warn below if all empty)
+                continue
             bx = self.atoms[rid]["x"]
             by = self.atoms[rid]["y"]
             ba = self.atoms[rid]["a"]
@@ -1218,7 +1246,6 @@ class Lattice(AutoSerialize):
             ref_b_parts.append(bb)
 
         if len(ref_x_parts) == 0:
-            # All reference sites were empty
             return empty_vector()
 
         # Concatenate pooled reference arrays
@@ -1247,10 +1274,25 @@ class Lattice(AutoSerialize):
         except np.linalg.LinAlgError:
             raise ValueError("Lattice vectors are singular and cannot be inverted.")
 
+        # Validate sigma_units
+        if sigma_units not in ("pixels", "unit_cell"):
+            raise ValueError(f"sigma_units must be 'pixels' or 'unit_cell', got '{sigma_units}'.")
+
+        # Pixel-space coords used for displacement calculation (unchanged regardless of units).
         query_coords = np.column_stack([Ax, Ay])
         ref_coords = np.column_stack([Bx, By])
 
-        # Pre-allocate result arrays
+        # KD-tree coordinate space: fractional (a, b) when sigma_units == "unit_cell" so that
+        # distance 1 == 1 unit cell exactly, using the already-stored fractional indices.
+        # Pixel space is used otherwise.
+        if sigma_units == "unit_cell":
+            kdtree_query_coords = np.column_stack([Aa, Ab])
+            kdtree_ref_coords = np.column_stack([Ba, Bb])
+        else:
+            kdtree_query_coords = query_coords
+            kdtree_ref_coords = ref_coords
+
+        # Pre-allocate result array memory
         x_arr = Ax.copy().astype(float)
         y_arr = Ay.copy().astype(float)
         a_arr = Aa.copy().astype(float)
@@ -1258,27 +1300,34 @@ class Lattice(AutoSerialize):
         da_arr = np.zeros_like(x_arr, dtype=float)
         db_arr = np.zeros_like(x_arr, dtype=float)
 
-        # KD-tree built on the pooled reference positions
-        tree = cKDTree(ref_coords)
+        # KD-tree built in the selected coordinate space
+        tree = cKDTree(kdtree_ref_coords)
 
-        if max_neighbours is None and reference_radius is None:
+        if max_neighbours is None and reference_sigma is None:
             raise ValueError(
-                "Either min_neighbours or max_neighbours or reference_radius must be passed."
+                "Either reference_sigma or both min_neighbours and max_neighbours must be passed."
             )
 
-        # Initialize lists for neighbour results
+        # Initialize arrays for results
         dists = []
         idxs = []
 
-        if reference_radius is not None:
-            # Radius-based query
-            if reference_radius < 1:
+        if reference_sigma is not None:
+            # Gaussian-weighted radius search: cutoff = 3 * sigma.
+            # When sigma_units == "unit_cell", sigma and the cutoff are in unit-cell units;
+            # the minimum meaningful value is > 0 rather than >= 1 pixel.
+            _sigma_min = 0.0 if sigma_units == "unit_cell" else 1.0
+            if reference_sigma <= _sigma_min:
                 raise ValueError(
-                    f"reference_radius must be atleast 1 pixel. You have passed : {reference_radius}"
+                    f"reference_sigma must be > {_sigma_min} (in {sigma_units} units). "
+                    f"You passed: {reference_sigma}"
                 )
+            self._kernel_sigma = reference_sigma
+            self._kernel_sigma_units = sigma_units
+            reference_radius = 3.0 * reference_sigma
 
             neighbor_lists = tree.query_ball_point(
-                query_coords,
+                kdtree_query_coords,
                 r=reference_radius,
                 workers=-1,
             )
@@ -1289,17 +1338,13 @@ class Lattice(AutoSerialize):
                     idxs.append(np.array([]))
                     continue
 
-                neighbor_coords = ref_coords[neighbors]
-                query_point = query_coords[i]
+                neighbor_coords = kdtree_ref_coords[neighbors]
+                query_point = kdtree_query_coords[i]
                 distances = np.linalg.norm(neighbor_coords - query_point, axis=1)
 
                 sort_idx = np.argsort(distances)
                 sorted_distances = distances[sort_idx]
                 sorted_indices = np.array(neighbors)[sort_idx]
-
-                if max_neighbours is not None and len(sorted_distances) > max_neighbours:
-                    sorted_distances = sorted_distances[:max_neighbours]
-                    sorted_indices = sorted_indices[:max_neighbours]
 
                 dists.append(sorted_distances)
                 idxs.append(sorted_indices)
@@ -1307,41 +1352,42 @@ class Lattice(AutoSerialize):
             lengths = np.array([len(row) for row in dists])
             if min_neighbours is not None and np.any(lengths < min_neighbours):
                 raise ValueError(
-                    "Failed to calculate enough nearest neighbours. Increase the reference_radius"
+                    "Failed to find enough neighbours for all atoms. Increase reference_sigma."
                 )
-
         else:
             # K-nearest neighbors query
             if min_neighbours is None or max_neighbours is None:
                 raise ValueError(
-                    "min_neighbours and max_neighbours should be specified if reference_radius is None"
+                    "min_neighbours and max_neighbours must both be specified when "
+                    "reference_sigma is None."
                 )
             if min_neighbours < 2 or max_neighbours < 2:
                 raise ValueError(
-                    "Must use atleast 2 nearest neighbours to calculate the Polarization"
+                    "Must use at least 2 nearest neighbours to calculate the polarization."
                 )
             if min_neighbours > max_neighbours:
-                raise ValueError("'min_neighbours' cannot be larger than 'max_neighbours'")
+                raise ValueError("'min_neighbours' cannot be larger than 'max_neighbours'.")
 
             dist_array, idx_array = tree.query(
-                query_coords,
+                kdtree_query_coords,
                 k=max_neighbours,
                 workers=-1,
             )
 
+            # Processing of results
             finite_mask = np.isfinite(dist_array)
-            for i in range(len(query_coords)):
+            for i in range(len(kdtree_query_coords)):
                 mask = finite_mask[i]
                 dists.append(dist_array[i][mask])
                 idxs.append(idx_array[i][mask])
 
-        # Neighbour checking
+        # Neighbor checking
         lengths = np.array([len(row) for row in dists])
         atoms_with_atleast_one_neighbour = lengths > 0
 
         if not np.any(atoms_with_atleast_one_neighbour):
             raise ValueError(
-                "Failed to calculate nearest neighbours for all atoms. Increase reference_radius."
+                "Failed to calculate nearest neighbours for all atoms. Increase reference_sigma."
             )
 
         if not np.all(atoms_with_atleast_one_neighbour):
@@ -1349,8 +1395,12 @@ class Lattice(AutoSerialize):
                 atoms_with_atleast_one_neighbour
             )
             raise Warning(
-                f"{missing_count} atoms do not have any neighbours identified. Try increasing reference_radius."
+                f"{missing_count} atoms do not have any neighbours identified. "
+                "Try increasing reference_sigma."
             )
+
+        # Small epsilon to guard against zero-distance neighbours in inverse-distance mode.
+        _inv_dist_eps = 1e-8
 
         # Pre-allocate arrays for better performance
         dr_arr = np.zeros(len(query_coords))
@@ -1360,12 +1410,15 @@ class Lattice(AutoSerialize):
         # Calculate displacements
         for i, (atom_dists, atom_idxs) in enumerate(zip(dists, idxs)):
             if len(atom_idxs) == 0:
+                # Arrays already initialized to 0
                 continue
 
+            # Check if we have enough neighbors
             if min_neighbours is not None and len(atom_idxs) < min_neighbours:
+                # Arrays already initialized to 0
                 continue
 
-            # Determine how many neighbours to use
+            # Determine how many neighbors to use
             num_neighbors_to_use = len(atom_idxs)
             if max_neighbours is not None:
                 num_neighbors_to_use = min(num_neighbors_to_use, max_neighbours)
@@ -1374,31 +1427,48 @@ class Lattice(AutoSerialize):
                     num_neighbors_to_use, min(min_neighbours, len(atom_idxs))
                 )
 
+            # Select the neighbors to use
             if num_neighbors_to_use < len(atom_idxs):
                 closest_order = np.argpartition(atom_dists, num_neighbors_to_use)[
                     :num_neighbors_to_use
                 ]
                 nbr_idx = atom_idxs[closest_order].astype(int)
+                nbr_dists = atom_dists[closest_order]
             else:
                 nbr_idx = atom_idxs.astype(int)
+                nbr_dists = atom_dists
 
-            # Actual position of the measured atom
+            # Get actual positions of the atoms (always in pixel space)
             actual_pos = np.array([x_arr[i], y_arr[i]])
 
-            # Expected positions using pooled reference atoms
-            # (Ba, Bb, Bx, By are already the concatenated reference arrays)
+            # Calculate the expected positions of the atoms using its n_neighbors
             a, b = a_arr[i], b_arr[i]
             ai, bi = Ba[nbr_idx], Bb[nbr_idx]
             xi, yi = Bx[nbr_idx], By[nbr_idx]
 
             fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
-            neighbours_found_idxs.append(fractional_diff.T)  # (n_neighbors, 2)
+            neighbours_found_idxs.append(
+                fractional_diff.T
+            )  # List[i] = np.array(shape = (n_neighbors, 2))
             neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
 
             expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
-            expected_position = np.mean(expected_positions, axis=1)  # (2,)
 
+            # Distance-weighted average of expected positions.
+            # Gaussian weights when reference_sigma is provided; inverse-distance otherwise.
+            # nbr_dists are in the KD-tree coordinate space (unit cells or pixels) — the
+            # relative weighting is correct in either case.
+            if reference_sigma is not None:
+                weights = np.exp(-(nbr_dists**2) / (2.0 * reference_sigma**2))
+            else:
+                weights = 1.0 / (nbr_dists + _inv_dist_eps)
+
+            weights /= weights.sum()
+            expected_position = expected_positions @ weights  # (2,)
+
+            # Difference between actual and expected positions gives us polarization.
             displacement_cartesian = actual_pos - expected_position
+
             dr_arr[i] = displacement_cartesian[0]
             dc_arr[i] = displacement_cartesian[1]
 
@@ -1414,6 +1484,7 @@ class Lattice(AutoSerialize):
             name="polarization",
         )
 
+        # Create structured array if needed
         if len(x_arr) > 0:
             arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
         else:
@@ -1421,22 +1492,30 @@ class Lattice(AutoSerialize):
 
         out.set_data(arr, 0)
 
-        # Find the most common fractional-index neighbour offsets
-        if neighbours_found_idxs:
-            max_neighbours_found = max(len(a) for a in neighbours_found_idxs)
+        # Find the indices of the most common neighbours found.
 
-            pair_bytes = []
-            dtype = neighbours_found_idxs[0].dtype
-            for a in neighbours_found_idxs:
-                for i in range(a.shape[0]):
-                    pair_bytes.append(a[i].tobytes())
+        # Step 1 : Calculate the max number of neighbours found.
+        max_neighbours_found = max(len(arr) for arr in neighbours_found_idxs)
 
-            counter = Counter(pair_bytes)
-            top = counter.most_common(max_neighbours_found)
-            most_common_neighbours = np.array(
-                [np.frombuffer(pair_b, dtype=dtype) for pair_b, count in top]
-            )
-            self.most_common_neighbours = most_common_neighbours
+        # Step 2: Collect all pairs as bytes
+        pair_bytes = []
+        dtype = neighbours_found_idxs[0].dtype  # Get dtype from first array
+        for arr in neighbours_found_idxs:
+            for i in range(arr.shape[0]):
+                pair_bytes.append(arr[i].tobytes())
+
+        # Step 3: Count frequencies
+        counter = Counter(pair_bytes)
+
+        # Step 4: Get top max_neighbours_found most common
+        top = counter.most_common(max_neighbours_found)
+
+        # Step 5: Convert back to array
+        most_common_neighbours = np.array(
+            [np.frombuffer(pair_b, dtype=dtype) for pair_b, count in top]
+        )
+
+        self.most_common_neighbours = most_common_neighbours
 
         if plot_polarization_vectors:
             if plot_legend:
@@ -1483,7 +1562,9 @@ class Lattice(AutoSerialize):
         run_with_restarts: bool = False,
         num_restarts: int = 1,
         verbose: bool = False,
+        spatial_average: bool = False,
         spatial_averaging_sigma: float | None = None,
+        sigma_units: str = "pixels",
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
         visualize_order_parameter: bool = True,
@@ -1540,13 +1621,30 @@ class Lattice(AutoSerialize):
             If True, prints diagnostic information including fitted means and error
             metrics for each restart.
 
+        spatial_average : bool, default=False
+            If True, applies post-GMM Gaussian spatial averaging of the order-parameter
+            probabilities.  Requires ``spatial_averaging_sigma`` to be set (or
+            ``self._kernel_sigma`` to be available from a prior ``measure_polarization``
+            call).
+
         spatial_averaging_sigma : float | None, default=None
-            If provided, applies post-GMM Gaussian spatial averaging of polarization
-            vectors. The neighbourhood radius is set to 3 * sigma so that the Gaussian
-            weight at the boundary is exp(-4.5) ~ 0.011, effectively zero.
-            Atoms within this radius are averaged using a combined weight:
-                w_ij = exp(-d_ij^2 / (2*sigma^2))
-            If None, no spatial averaging is performed.
+            Gaussian width used for spatial averaging when ``spatial_average=True``.
+            The neighbourhood radius is set to ``3 * sigma`` so that the Gaussian weight
+            at the boundary is ``exp(-4.5) ~ 0.011``, effectively zero.  Each neighbour
+            is weighted by ``exp(-d² / (2 * sigma²))``.  If None and
+            ``spatial_average=True``, falls back to ``self._kernel_sigma`` (set by a
+            prior ``measure_polarization`` call with ``reference_sigma``).  Units are
+            controlled by ``sigma_units``.
+
+        sigma_units : str, default="pixels"
+            Units in which ``spatial_averaging_sigma`` (and the fallback
+            ``self._kernel_sigma``) is expressed.  Accepted values:
+
+            - ``"pixels"``    — sigma is already in pixel units (no conversion).
+            - ``"unit_cell"`` — sigma is expressed as a multiple of the mean lattice
+              spacing, defined as ``(|u| + |v|) / 2`` where ``u`` and ``v`` are the
+              lattice basis vectors in pixels.  The value is multiplied by this scale
+              factor before use.
 
         plot_order_parameter : bool, default=True
             If True, overlays sites on self._image.array and colors them by their full
@@ -1845,6 +1943,7 @@ class Lattice(AutoSerialize):
             "full",
         ]:
             gmm_covariance_type = "full"
+
         # Fit GMM with N Gaussians
         if phase_polarization_peak_array is None:
             gmm = TorchGMM(
@@ -1883,12 +1982,13 @@ class Lattice(AutoSerialize):
 
         self.gmm = gmm
 
-        # Intialize best fit tracking variables if run_with_restarts
+        # Initialise best fit tracking variables if run_with_restarts
         if run_with_restarts:
             best_error = np.inf
             best_means = None
             best_probabilities = None
             best_cov = None
+            best_gmm_state = None  # snapshot of internal tensor state
 
         for i in range(num_restarts):
             gmm.fit(data)
@@ -1913,6 +2013,16 @@ class Lattice(AutoSerialize):
                     best_means = means
                     best_probabilities = probabilities
                     best_cov = gmm.covariances_
+                    # Snapshot the internal tensor state so self.gmm can be
+                    # restored to the best-fit model after all restarts finish.
+                    best_gmm_state = {
+                        "_means": gmm._means.detach().clone(),
+                        "_covariances": gmm._covariances.detach().clone(),
+                        "_weights": gmm._weights.detach().clone(),
+                        "means_": gmm.means_.copy(),
+                        "covariances_": gmm.covariances_.copy(),
+                        "weights_": gmm.weights_.copy(),
+                    }
 
         if run_with_restarts and verbose:
             print("Best results after restarts:")
@@ -1934,6 +2044,14 @@ class Lattice(AutoSerialize):
 
         # Save GMM data
         if run_with_restarts:
+            # Restore internal tensor state to the best restart so self.gmm is
+            # consistent with the saved probabilities and means.
+            gmm._means = best_gmm_state["_means"]
+            gmm._covariances = best_gmm_state["_covariances"]
+            gmm._weights = best_gmm_state["_weights"]
+            gmm.means_ = best_gmm_state["means_"]
+            gmm.covariances_ = best_gmm_state["covariances_"]
+            gmm.weights_ = best_gmm_state["weights_"]
             self._polarization_means = best_means
             self._order_parameter_probabilities = best_probabilities
         else:
@@ -1946,21 +2064,39 @@ class Lattice(AutoSerialize):
         num_components = num_phases
 
         # --- Post-GMM spatial averaging ---
-        # Radius is fixed at 3*sigma so the Gaussian weight at the boundary
-        # is exp(-4.5) ~ 0.011, effectively zero — no hard edge artefacts.
-        current_fractional = None
-        if spatial_averaging_sigma is not None and spatial_averaging_sigma > 0:
-            current_fractional = np.column_stack([da_arr, db_arr])
-            best_probabilities, current_fractional = self._spatial_average_order_parameter(
-                polarization_vectors,
-                spatial_averaging_sigma,
-                current_fractional,
-            )
+        if spatial_average:
+            if spatial_averaging_sigma is None and not hasattr(self, "_kernel_sigma"):
+                raise ValueError(
+                    "spatial_averaging_sigma must be specified for spatial averaging "
+                    "when no reference_sigma was provided to measure_polarization()."
+                )
+            elif spatial_averaging_sigma is None and hasattr(self, "_kernel_sigma"):
+                spatial_averaging_sigma = self._kernel_sigma
+            elif sigma_units not in ("pixels", "unit_cell"):
+                raise ValueError(
+                    f"sigma_units must be 'pixels' or 'unit_cell', got '{sigma_units}'."
+                )
+
+            if spatial_averaging_sigma > 0:
+                best_probabilities = self._spatial_average_order_parameter(
+                    polarization_vectors,
+                    spatial_averaging_sigma,
+                    sigma_units=sigma_units,
+                )
+            else:
+                raise ValueError("spatial_averaging_sigma must be positive.")
 
         # --- Combined Plot: Scatter overlaid on Contour ---
         if plot_gmm_visualization:
             from matplotlib.path import Path
             from matplotlib.ticker import FuncFormatter
+
+            if spatial_average:
+                import warnings
+
+                warnings.warn(
+                    "GMM Visualization with spatial averaging may not be the most accurate."
+                )
 
             # Define preset colors based on num_phases
             preset_contour_cmap = "gray_r"
@@ -2056,16 +2192,12 @@ class Lattice(AutoSerialize):
             ax.contour(X, Y, Z, levels=15, cmap=contour_cmap, linewidths=0.5, alpha=0.9)
 
             # Second: Overlay scatter points with classification colors.
-            # If spatial averaging was applied, plot the averaged vectors so the
-            # scatter positions match what the GMM was re-scored against.
             point_colors = create_colors_from_probabilities(
                 best_probabilities, num_components, scatter_colours
             )
-            scatter_da = current_fractional[:, 0] if current_fractional is not None else da_arr
-            scatter_db = current_fractional[:, 1] if current_fractional is not None else db_arr
             ax.scatter(
-                scatter_da,
-                scatter_db,
+                da_arr,
+                db_arr,
                 c=point_colors,
                 alpha=0.7,
                 s=20,
@@ -2122,37 +2254,26 @@ class Lattice(AutoSerialize):
             ax.set_title("Classification & Contour Overlay")
 
             # Calculate position for colorbar axis
-            # Position it to the right of ax with some spacing
             pos_main = ax.get_position()
 
             # Add appropriate color reference based on number of phases
             if num_phases == 2:
-                # Define colorbar parameters
-                cbar_width_ratio = 0.02  # Width of colorbar relative to figure
-                cbar_gap = 0.02  # Gap between main plot and colorbar
-
-                # Calculate colorbar position
+                cbar_width_ratio = 0.02
+                cbar_gap = 0.02
                 cbar_left = pos_main.x0 + pos_main.width + cbar_gap
                 cbar_width = cbar_width_ratio
                 cbar_bottom = pos_main.y0
                 cbar_height = pos_main.height
-
                 ax_cbar_gmm = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
-
                 add_2phase_colorbar(ax_cbar_gmm, scatter_colours)
             elif num_phases == 3:
-                # Define colorbar parameters
-                cbar_width_ratio = 0.2  # Width of colorbar relative to figure
-                cbar_gap = 0.02  # Gap between main plot and colorbar
-
-                # Calculate colorbar position
+                cbar_width_ratio = 0.2
+                cbar_gap = 0.02
                 cbar_left = pos_main.x0 + pos_main.width + cbar_gap
                 cbar_width = cbar_width_ratio
                 cbar_bottom = pos_main.y0
                 cbar_height = pos_main.height
-
                 ax_cbar_gmm = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
-
                 add_3phase_color_triangle(ax_cbar_gmm, scatter_colours)
             # For num_phases > 3 or == 1, don't add any color reference
 
@@ -2164,17 +2285,11 @@ class Lattice(AutoSerialize):
                 preset_scatter_colours = site_colors
                 if "scatter_colours" in kwargs:
                     scatter_colours_input = kwargs["scatter_colours"]
-
-                    # Try to convert to RGB format
                     scatter_colours_rgb = convert_colors_to_rgb(scatter_colours_input, num_phases)
-
                     if scatter_colours_rgb is not None:
-                        # Successfully converted to (num_phases, 3) RGB array
                         scatter_colours = scatter_colours_rgb
                     else:
-                        # Check if it's a single valid color
                         if is_valid_color(scatter_colours_input):
-                            # Convert single color to repeated array for indexing
                             single_color_rgb = mcolors.to_rgb(scatter_colours_input)
                             scatter_colours = np.tile(single_color_rgb, (num_phases, 1))
                             print(
@@ -2239,7 +2354,6 @@ class Lattice(AutoSerialize):
                     return axes
 
                 if num_phases == 2:
-                    # Parameters specific to 2-phase
                     cbar_width = kwargs.get("cbar_width", 0.5)
                     refs_width = kwargs.get("refs_width", 4)
                     height_ratios = kwargs.get("height_ratios", [1, 1])
@@ -2251,7 +2365,6 @@ class Lattice(AutoSerialize):
                         f"height_ratios must have {num_phases} elements"
                     )
 
-                    # Calculate positions
                     total_width = (
                         main_width + cbar_width + refs_width + wspace_main_cbar + wspace_cbar_refs
                     )
@@ -2265,7 +2378,6 @@ class Lattice(AutoSerialize):
                     left_cbar = left_main + width_main + gap1
                     left_refs = left_cbar + width_cbar + gap2
 
-                    # Create axes
                     ax_main = fig.add_axes(
                         [left_main, bottom_margin, width_main, available_height]
                     )
@@ -2275,11 +2387,8 @@ class Lattice(AutoSerialize):
                     ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
 
                 elif num_phases == 3:
-                    # Parameters specific to 3-phase
                     refs_width = kwargs.get("refs_width", 4)
-                    height_ratios = kwargs.get(
-                        "height_ratios", [1, 1, 1, 1]
-                    )  # 4 refs: triangle + 3 phases
+                    height_ratios = kwargs.get("height_ratios", [1, 1, 1, 1])
                     hspace = kwargs.get("hspace", 0.065)
                     wspace_main_refs = kwargs.get("wspace_main_refs", 0.2)
 
@@ -2287,7 +2396,6 @@ class Lattice(AutoSerialize):
                         "height_ratios must have 4 elements for 3-phase visualization"
                     )
 
-                    # Calculate positions
                     total_width = main_width + refs_width + wspace_main_refs
                     width_main = main_width / total_width * available_width
                     width_refs = refs_width / total_width * available_width
@@ -2296,23 +2404,17 @@ class Lattice(AutoSerialize):
                     left_main = left_margin
                     left_refs = left_main + width_main + gap
 
-                    # Create axes
                     ax_main = fig.add_axes(
                         [left_main, bottom_margin, width_main, available_height]
                     )
                     ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
-
-                    # No separate ax_cbar for 3-phase
                     ax_cbar = None
 
                 else:
-                    # Parameters for n-phase (general case)
                     refs_width = kwargs.get("refs_width", 4)
                     height_ratios = kwargs.get("height_ratios", [1] * num_phases)
                     wspace_main_refs = kwargs.get("wspace_main_refs", 0.05)
 
-                    # Scale hspace down as num_phases increases to prevent negative heights.
-                    # Reserve at most 30% of available_height for gaps total.
                     max_gap_fraction = 0.3
                     default_hspace = (
                         (max_gap_fraction * available_height) / (num_phases - 1)
@@ -2325,7 +2427,6 @@ class Lattice(AutoSerialize):
                         f"height_ratios must have {num_phases} elements"
                     )
 
-                    # Calculate positions
                     total_width = main_width + refs_width + wspace_main_refs
                     width_main = main_width / total_width * available_width
                     width_refs = refs_width / total_width * available_width
@@ -2334,23 +2435,18 @@ class Lattice(AutoSerialize):
                     left_main = left_margin
                     left_refs = left_main + width_main + gap
 
-                    # Create axes
                     ax_main = fig.add_axes(
                         [left_main, bottom_margin, width_main, available_height]
                     )
                     ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
-
-                    # No colorbar for num_phases > 3
                     ax_cbar = None
 
             else:
-                # Extract parameters with defaults
                 figsize = kwargs.get("figsize", (12, 12))
                 main_width = kwargs.get("main_width", 10)
 
                 fig = plt.figure(figsize=figsize)
 
-                # Common margin and position calculations
                 left_margin = 0.2
                 right_margin = 0.2
                 bottom_margin = 0.1
@@ -2378,12 +2474,9 @@ class Lattice(AutoSerialize):
                     ax_cbar = fig.add_axes(
                         [left_cbar, bottom_margin, width_cbar, available_height]
                     )
-
                 else:
-                    # No colorbar for num_phases > 3
                     width_main = available_width
                     left_main = left_margin
-
                     ax_main = fig.add_axes(
                         [left_main, bottom_margin, width_main, available_height]
                     )
@@ -2412,14 +2505,11 @@ class Lattice(AutoSerialize):
 
             # Add appropriate color reference based on number of phases
             if num_phases == 2 and ax_cbar is not None:
-                # For 2 phases: colorbar next to main figure
                 add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=ax_main)
             elif num_phases == 3:
                 if visualize_order_parameter:
-                    # For 3 phases: color triangle is the first reference plot (ref_axes[0])
                     add_3phase_color_triangle(ref_axes[0], scatter_colours, match_ax=ax_main)
                 else:
-                    # If not visualize_order_parameter, use ax_cbar for color triangle
                     add_3phase_color_triangle(ax_cbar, scatter_colours)
             # For num_phases > 3 or == 1, don't add any color reference
 
@@ -2484,87 +2574,86 @@ class Lattice(AutoSerialize):
             if tight_layout:
                 fig.tight_layout()
             fig.show()
+
         return self
 
     # --- Helper Functions ---
     def _spatial_average_order_parameter(
         self,
-        polarization_vectors: "Vector",
-        spatial_averaging_sigma: float,
-        current_fractional: "NDArray",
-    ) -> "tuple[NDArray, NDArray]":
-        """
-        Spatially average polarization vectors using a Gaussian distance-weighted
-        mean, then re-classify the averaged vectors using the fitted GMM.
-
-        For each atom i the averaged Cartesian polarization is:
-
-            p_i_avg = sum_j[ w_ij * p_j ] / sum_j[ w_ij ]
-
-        where the Gaussian weight is:
-
-            w_ij = exp( -d_ij^2 / (2 * sigma^2) )
-
-        The neighbourhood search radius is fixed at 3 * sigma so that the
-        Gaussian weight at the boundary is exp(-4.5) ~ 0.011, effectively zero,
-        eliminating hard edge artefacts without requiring a separate radius
-        parameter.
-
-
-        Parameters
-        ----------
-        polarization_vectors : Vector
-            Only the pixel positions (x, y) are read from here.
-        spatial_averaging_sigma : float
-            Gaussian sigma in pixels. The search radius is 3 * sigma.
-        current_fractional : NDArray, shape (N, 2)
-            Current fractional polarization (da, db). Pass raw vectors on the
-            first call and the returned averaged_fractional on each subsequent
-            call so that smoothing accumulates across iterations.
-        Returns
-        -------
-        final_probabilities : NDArray, shape (N, num_phases)
-        averaged_fractional : NDArray, shape (N, 2)
-            Pass as current_fractional on the next iteration.
-        """
+        polarization_vectors: Vector,
+        sigma: float,
+        sigma_units: str = "pixels",
+    ) -> NDArray:
         from scipy.spatial import cKDTree
 
         _, u, v = self._lat
-        L = np.stack([u, v])  # (2, 2); cartesian = fractional @ L
+        L = np.stack([u, v])
 
         x_arr = polarization_vectors[0]["x"]
         y_arr = polarization_vectors[0]["y"]
+        a_arr = polarization_vectors[0]["a"]
+        b_arr = polarization_vectors[0]["b"]
 
-        cartesian_polarization = current_fractional @ L  # (N, 2)
+        da_arr = polarization_vectors[0]["da"]
+        db_arr = polarization_vectors[0]["db"]
 
-        sigma = float(spatial_averaging_sigma)
-        # Radius is 3*sigma: Gaussian weight at boundary ~ exp(-4.5) ~ 0.011
-        radius = 3.0 * sigma
+        fractional_polarization = np.column_stack([da_arr, db_arr])  # (num_atoms, 2)
+        cartesian_polarization = fractional_polarization @ L
 
-        coords = np.column_stack([x_arr, y_arr])
-        tree = cKDTree(coords)
+        averaged_polarization = np.zeros_like(cartesian_polarization)
 
-        averaged_cartesian = np.empty_like(cartesian_polarization)
+        pixel_coords = np.column_stack([x_arr, y_arr])
+        fractional_coords = np.column_stack([a_arr, b_arr])
+
+        if sigma_units == "unit_cell":
+            # Neighbor selection: radius in fractional (a, b) space so that sigma
+            # is expressed in unit cells and is independent of pixel scale.
+            kdtree_coords = fractional_coords
+            radius = 3.0 * sigma
+            # Gaussian kernel sigma in pixels: convert here, only for weighting.
+            _uc_scale = (np.linalg.norm(u) + np.linalg.norm(v)) / 2.0
+            sigma_px = sigma * _uc_scale
+        else:
+            # Both neighbor selection and weighting in pixel space.
+            kdtree_coords = pixel_coords
+            radius = 3.0 * sigma
+            sigma_px = sigma
+
+        tree = cKDTree(kdtree_coords)
 
         for i in range(len(x_arr)):
-            indices = np.asarray(tree.query_ball_point(coords[i], r=radius))
+            indices = tree.query_ball_point(kdtree_coords[i], r=radius)
 
-            distances = np.linalg.norm(coords[indices] - coords[i], axis=1)
-            weights = np.exp(-(distances**2) / (2.0 * sigma**2))
+            # Exclude the atom itself to avoid double self-weighting.
+            indices = [j for j in indices if j != i]
 
-            averaged_cartesian[i] = (weights[:, None] * cartesian_polarization[indices]).sum(
+            if len(indices) == 0:
+                averaged_polarization[i] = cartesian_polarization[i]
+                continue
+
+            # Always weight by physical (pixel) distance regardless of sigma_units.
+            pixel_dist = np.linalg.norm(pixel_coords[indices] - pixel_coords[i], axis=1)
+            weights = np.exp(-(pixel_dist**2) / (2 * sigma_px**2))
+
+            neighbour_avg = (weights[:, None] * cartesian_polarization[indices]).sum(
                 axis=0
             ) / weights.sum()
 
+            # Self-weight at distance 0 is exp(0) = 1; blend self with neighbours.
+            self_weight = 1.0
+            averaged_polarization[i] = (
+                self_weight * cartesian_polarization[i] + weights.sum() * neighbour_avg
+            ) / (self_weight + weights.sum())
+
         try:
-            averaged_fractional = averaged_cartesian @ np.linalg.inv(L)
+            average_fractional_polarization = averaged_polarization @ np.linalg.inv(L)
         except np.linalg.LinAlgError:
             raise ValueError("Lattice vectors are singular and cannot be inverted.")
 
-        final_probabilities = self.gmm.predict_proba(averaged_fractional)
+        final_probabilities = self.gmm.predict_proba(average_fractional_polarization)
         self._order_parameter_probabilities = final_probabilities
 
-        return final_probabilities, averaged_fractional
+        return final_probabilities
 
     # --- Plotting Functions ---
     def plot_polarization_vectors(

@@ -13,7 +13,7 @@ class TorchGMM:
     def __init__(
         self,
         n_components,
-        covariance_type="full",  # Now support: "full", "diag", "spherical", "tied"
+        covariance_type="full",  # Now supports: "full", "diag", "spherical", "tied"
         means_init=None,
         tol=1e-4,
         max_iter=200,
@@ -23,7 +23,7 @@ class TorchGMM:
     ):
         self.n_components = int(n_components)
         self.max_iter = abs(int(max_iter))
-        self.covariance_type = covariance_type  # Remove the restriction
+        self.covariance_type = covariance_type
         self.means_init = None if means_init is None else np.asarray(means_init, dtype=np.float32)
         self.tol = abs(float(tol))
         self.reg_covar = float(reg_covar)
@@ -83,7 +83,7 @@ class TorchGMM:
         N, D = X.shape
         K = self.n_components
 
-        # Initialize means (unchanged)
+        # Initialize means
         if self.means_init is not None:
             if self.means_init.shape != (K, D):
                 raise ValueError(
@@ -202,7 +202,7 @@ class TorchGMM:
         Nk = r.sum(dim=0).clamp_min(1e-12)
         self._weights = (Nk / N).clamp_min(1e-12)
 
-        # Update means (unchanged)
+        # Update means
         self._means = (r.T @ X) / Nk[:, None]
 
         # Update covariances based on type
