@@ -3271,19 +3271,16 @@ class Lattice(AutoSerialize):
             Returns:
                 numpy array of shape (num_phases, 3) with RGB values
             """
-            # If it's a function (like site_colors), call it for each index
             if callable(colors):
                 rgb_array = np.array([colors(i)[:3] for i in range(num_phases)])
                 return rgb_array
 
-            # If it's already an array, validate dimensions
             if isinstance(colors, np.ndarray):
                 if colors.shape == (num_phases, 3):
                     return colors
                 else:
                     return None
 
-            # If it's a list/tuple of color names or values
             if isinstance(colors, (list, tuple)):
                 try:
                     rgb_array = np.array([mcolors.to_rgb(c) for c in colors])
@@ -3296,7 +3293,6 @@ class Lattice(AutoSerialize):
 
             return None
 
-        # Helper function to validate color
         def is_valid_color(color):
             """Check if a color is valid in matplotlib"""
             try:
@@ -3306,14 +3302,14 @@ class Lattice(AutoSerialize):
                 return False
 
         # Extract alpha values from kwargs with defaults
-        alpha_pol_measurement = kwargs.get("alpha_pol_measurement", 1.0)
+        # alpha_pol_measurement = kwargs.get("alpha_pol_measurement", 1.0)
         alpha_phase_atom = kwargs.get("alpha_phase_atom", 1.0)
         alpha_reference_atom = kwargs.get("alpha_reference_atom", 1.0)
         alpha_phase_arrow = kwargs.get("alpha_phase_arrow", 1.0)
         alpha_other_atom = kwargs.get("alpha_other_atom", 1.0)
 
         # Extract zorder values from kwargs with defaults
-        zorder_pol_measurement = kwargs.get("zorder_pol_measurement", 1)
+        # zorder_pol_measurement = kwargs.get("zorder_pol_measurement", 1)
         zorder_other_atom = kwargs.get("zorder_other_atom", 5)
         zorder_reference_atoms = kwargs.get("zorder_reference_atoms", 6)
         zorder_phase_atom = kwargs.get("zorder_phase_atom", 7)
@@ -3359,25 +3355,13 @@ class Lattice(AutoSerialize):
         # Get the polarization of each phase
         pol_vector = phase_vector @ A.T  # (2,)
 
-        # Tile to get all sites within the distanceof the max neighbours considered
-        max_dist_ref_ind = reference_atom_ind[
-            np.argmax(np.linalg.norm(reference_atom_ind @ A.T, axis=1))
-        ]
-        max_dist = np.linalg.norm(max_dist_ref_ind @ A.T)
-        for i in range(int(np.ceil(np.max(np.abs(max_dist_ref_ind))))):
-            measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-                -1, 2
-            )
-            if other_atom_ind.size > 0:
-                other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-                    -1, 2
-                )
-        measured_atom_ind = measured_atom_ind[
-            np.where(np.linalg.norm(measured_atom_ind @ A.T, axis=1) < max_dist)
-        ]
-        other_atom_ind = other_atom_ind[
-            np.where(np.linalg.norm(other_atom_ind @ A.T, axis=1) < max_dist)
-        ]
+        # Filter all atom types to within 1 unit cell distance: max(|a|, |b|) <= 1.
+        reference_atom_ind = reference_atom_ind[np.max(np.abs(reference_atom_ind), axis=1) <= 1.0]
+        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+        measured_atom_ind = measured_atom_ind[np.max(np.abs(measured_atom_ind), axis=1) <= 1.0]
+        if other_atom_ind.size > 0:
+            other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+            other_atom_ind = other_atom_ind[np.max(np.abs(other_atom_ind), axis=1) <= 1.0]
 
         # Convert to Cartesian coordinates
         reference_atom_pos = reference_atom_ind @ A.T
@@ -3386,25 +3370,17 @@ class Lattice(AutoSerialize):
             other_atom_pos = other_atom_ind @ A.T
 
         # Extract and validate color parameters
-        # Default presets
         preset_scatter_colours = site_colors
         preset_reference_atom_colour = site_colors(-1)
         preset_other_atom_colour = site_colors(-2)
 
-        # Check and assign scatter_colours (for phase atoms)
         if "scatter_colours" in kwargs:
             scatter_colours_input = kwargs["scatter_colours"]
-
-            # Try to convert to RGB format
             scatter_colours_rgb = convert_colors_to_rgb(scatter_colours_input, num_phases)
-
             if scatter_colours_rgb is not None:
-                # Successfully converted to (num_phases, 3) RGB array
                 scatter_colours = scatter_colours_rgb
             else:
-                # Check if it's a single valid color
                 if is_valid_color(scatter_colours_input):
-                    # Convert single color to repeated array
                     single_color_rgb = mcolors.to_rgb(scatter_colours_input)
                     scatter_colours = np.tile(single_color_rgb, (num_phases, 1))
                     print(
@@ -3416,7 +3392,6 @@ class Lattice(AutoSerialize):
         else:
             scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
 
-        # Check and assign reference_atom_colour
         if "reference_atom_colour" in kwargs:
             if is_valid_color(kwargs["reference_atom_colour"]):
                 reference_atom_colour = kwargs["reference_atom_colour"]
@@ -3428,7 +3403,6 @@ class Lattice(AutoSerialize):
         else:
             reference_atom_colour = preset_reference_atom_colour
 
-        # Check and assign other_atom_colour
         if "other_atom_colour" in kwargs:
             if is_valid_color(kwargs["other_atom_colour"]):
                 other_atom_colour = kwargs["other_atom_colour"]
@@ -3440,12 +3414,10 @@ class Lattice(AutoSerialize):
         else:
             other_atom_colour = preset_other_atom_colour
 
-        # Convert reference_atom_colour to RGB tuple for color_override
         reference_atom_colour_rgb = np.array(mcolors.to_rgb(reference_atom_colour))
         other_atom_colour_rgb = np.array(mcolors.to_rgb(other_atom_colour))
         phase_color = scatter_colours[phase_index]
 
-        # Create figure with vertical subplots
         assert figax is not None, "figax must be provided."
         fig, ax = figax
         plt.figure(fig.number)
@@ -3453,35 +3425,25 @@ class Lattice(AutoSerialize):
 
         # --- Calculate adaptive arrow head dimensions ---
         if adaptive_head:
-            # Calculate arrow length
             arrow_length = np.linalg.norm(pol_vector)
-
-            # Calculate adaptive head dimensions
             adaptive_headlength = min(phase_arrow_headlength, arrow_length * max_head_ratio)
             adaptive_headwidth = min(phase_arrow_headwidth, arrow_length * max_head_ratio)
-
-            # Ensure minimum visibility
             min_headlength = 0.5
             min_headwidth = 0.5
             adaptive_headlength = max(adaptive_headlength, min_headlength)
             adaptive_headwidth = max(adaptive_headwidth, min_headwidth)
-
-            # Use adaptive dimensions
             current_headlength = adaptive_headlength
             current_headwidth = adaptive_headwidth
         else:
-            # Use fixed dimensions
             current_headlength = phase_arrow_headlength
             current_headwidth = phase_arrow_headwidth
 
-        # Arrow style parameters for phase arrows
         phase_arrowstyle = ArrowStyle.Simple(
             head_length=current_headlength,
             head_width=current_headwidth,
             tail_width=phase_arrow_tail_width,
         )
 
-        # Plot other atoms if they exist
         if other_atom_ind.size > 0:
             fig, ax = plot_atoms_2d(
                 other_atom_pos,
@@ -3492,7 +3454,7 @@ class Lattice(AutoSerialize):
                 zorder=zorder_other_atom,
                 color_override=other_atom_colour_rgb,
             )
-        # Plot reference atoms
+
         fig, ax = plot_atoms_2d(
             reference_atom_pos,
             site_number=-1,
@@ -3503,7 +3465,6 @@ class Lattice(AutoSerialize):
             color_override=reference_atom_colour_rgb,
         )
 
-        # Plot expected value of phase atoms
         fig, ax = plot_atoms_2d(
             measured_atom_pos,
             site_number=phase_index,
@@ -3514,9 +3475,8 @@ class Lattice(AutoSerialize):
             color_override=phase_color,
         )
 
-        # Draw arrow from expected to measured
         arrow = FancyArrowPatch(
-            (0, 0),  # Start point
+            (0, 0),
             (pol_vector[1] * arrow_scale_factor, pol_vector[0] * arrow_scale_factor),
             arrowstyle=phase_arrowstyle,
             mutation_scale=1.0,
@@ -3531,22 +3491,20 @@ class Lattice(AutoSerialize):
         )
         ax.add_patch(arrow)
 
-        for ref_atom in reference_atom_pos:
-            ax.plot(
-                [ref_atom[1], 0],
-                [ref_atom[0], 0],
-                linestyle="--",
-                linewidth=2,
-                color="black",
-                alpha=alpha_pol_measurement,
-                zorder=zorder_pol_measurement,
-            )
+        # for ref_atom in reference_atom_pos:
+        #     ax.plot(
+        #         [ref_atom[1], 0],
+        #         [ref_atom[0], 0],
+        #         linestyle="--",
+        #         linewidth=2,
+        #         color="black",
+        #         alpha=alpha_pol_measurement,
+        #         zorder=zorder_pol_measurement,
+        #     )
 
-        # Get the axis limits
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
 
-        # Draw rectangle border
         rect = Rectangle(
             (xlim[0], ylim[0]),
             xlim[1] - xlim[0],
@@ -3619,25 +3577,13 @@ class Lattice(AutoSerialize):
         if other_atom_ind.size > 0:
             other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
 
-        # Tile to get all sites within the distanceof the max neighbours considered
-        max_dist_ref_ind = reference_atom_ind[
-            np.argmax(np.linalg.norm(reference_atom_ind @ A.T, axis=1))
-        ]
-        max_dist = np.linalg.norm(max_dist_ref_ind @ A.T)
-        for i in range(int(np.ceil(np.max(np.abs(max_dist_ref_ind))))):
-            measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-                -1, 2
-            )
-            if other_atom_ind.size > 0:
-                other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-                    -1, 2
-                )
-        measured_atom_ind = measured_atom_ind[
-            np.where(np.linalg.norm(measured_atom_ind @ A.T, axis=1) < max_dist)
-        ]
-        other_atom_ind = other_atom_ind[
-            np.where(np.linalg.norm(other_atom_ind @ A.T, axis=1) < max_dist)
-        ]
+        # Filter all atom types to within 1 unit cell distance: max(|a|, |b|) <= 1.
+        reference_atom_ind = reference_atom_ind[np.max(np.abs(reference_atom_ind), axis=1) <= 1.0]
+        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+        measured_atom_ind = measured_atom_ind[np.max(np.abs(measured_atom_ind), axis=1) <= 1.0]
+        if other_atom_ind.size > 0:
+            other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+            other_atom_ind = other_atom_ind[np.max(np.abs(other_atom_ind), axis=1) <= 1.0]
 
         # Convert to Cartesian coordinates
         reference_atom_pos = reference_atom_ind @ A.T
@@ -3652,7 +3598,6 @@ class Lattice(AutoSerialize):
             plt.figure(fig.number)
             plt.sca(ax)
 
-        # Plot the three sets of positions using plot_atoms_2d
         if len(other_atom_pos) > 0:
             fig, ax = plot_atoms_2d(
                 other_atom_pos,
@@ -3684,7 +3629,6 @@ class Lattice(AutoSerialize):
             color_override=measured_color,
         )
 
-        # Plot dashed lines to show polarization calculation
         for ref_atom in reference_atom_pos:
             ax.plot(
                 [ref_atom[1], 0],
@@ -3695,15 +3639,12 @@ class Lattice(AutoSerialize):
                 zorder=0,
             )
 
-        # Formatting
         ax.set_aspect("equal")
         ax.invert_xaxis()
 
-        # Get the axis limits
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
 
-        # Draw rectangle border
         rect = Rectangle(
             (xlim[0], ylim[0]),
             xlim[1] - xlim[0],
@@ -3880,8 +3821,9 @@ def create_colors_from_probabilities(probabilities, num_phases, category_colors=
 
 def add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=None):
     """
-    Add a 1D colorbar for 2-phase system to a given axes
-    Creates a colormap that goes: color1 -> white (center) -> color0 (vertically inverted)
+    Add a 1D colorbar for 2-phase system to a given axes.
+    Creates a colormap that goes: color1 (bottom, OP=+1) -> white (center, OP=0) -> color0 (top, OP=-1).
+    The y-axis shows the order parameter value: OP = p1 - p0, ranging from -1 to +1.
 
     Parameters:
     -----------
@@ -3908,7 +3850,7 @@ def add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=None):
     n_bins = 256
     cmap = LinearSegmentedColormap.from_list("two_phase", colors_list, N=n_bins)
 
-    # Create gradient (inverted: from 1 to 0)
+    # gradient: 1 at bottom → color1 (-1), 0 at top → color0 (+1)
     gradient = np.linspace(1, 0, 256).reshape(256, 1)
 
     plt.sca(ax_cbar)
@@ -3924,11 +3866,17 @@ def add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=None):
         # Set colorbar to match the height and vertical position of match_ax
         ax_cbar.set_position([pos_cbar.x0, pos_match.y0, pos_cbar.width, pos_match.height])
 
-    # Configure ticks and labels (inverted positions and labels)
+    # Tick positions (pixel indices) mapped to order parameter values
+    # pixel 0 = bottom = -1, pixel 255 = top = +1
+    tick_pixels = [0, 64, 128, 192, 255]
+    tick_labels = ["-1", "-0.5", "0", "+0.5", "+1"]
+
     ax_cbar.set_xticks([])
-    ax_cbar.set_yticks([0, 128, 255])
-    ax_cbar.set_yticklabels(["Phase 1", "Uncertain", "Phase 0"])
+    ax_cbar.set_yticks(tick_pixels)
+    ax_cbar.set_yticklabels(tick_labels)
     ax_cbar.yaxis.tick_right()
+    ax_cbar.set_ylabel("Order Parameter", rotation=270, labelpad=14)
+    ax_cbar.yaxis.set_label_position("right")
 
     return ax_cbar
 
