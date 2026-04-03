@@ -3504,6 +3504,14 @@ class Lattice(AutoSerialize):
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
+        x_range = xlim[1] - xlim[0]
+        y_range = ylim[1] - ylim[0]
+        x_adjustment = x_range * 0.1
+        y_adjustment = y_range * 0.1
+        xlim = (xlim[0] - x_adjustment, xlim[1] + x_adjustment)
+        ylim = (ylim[0] - y_adjustment, ylim[1] + y_adjustment)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
 
         rect = Rectangle(
             (xlim[0], ylim[0]),
@@ -3644,6 +3652,14 @@ class Lattice(AutoSerialize):
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
+        x_range = xlim[1] - xlim[0]
+        y_range = ylim[1] - ylim[0]
+        x_adjustment = x_range * 0.1
+        y_adjustment = y_range * 0.1
+        xlim = (xlim[0] - x_adjustment, xlim[1] + x_adjustment)
+        ylim = (ylim[0] - y_adjustment, ylim[1] + y_adjustment)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
 
         rect = Rectangle(
             (xlim[0], ylim[0]),

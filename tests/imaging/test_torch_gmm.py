@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from quantem.imaging.lattice import TorchGMM
+from quantem.imaging.torch_gmm import TorchGMM
 
 
 class TestTorchGMMInitialization:
