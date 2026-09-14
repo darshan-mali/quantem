@@ -1206,6 +1206,249 @@ class Lattice(AutoSerialize):
 
         return self
 
+    def measure_polarization(
+        self,
+        measure_ind: int,
+        reference_ind: int,
+        reference_radius: float | None = None,
+        min_neighbours: int | None = 2,
+        max_neighbours: int | None = None,
+    ) -> "Lattice":
+        """
+        Measure the polarization of atoms at one site with respect to atoms at another site.
+
+        For each atom of the measured site, an expected position is inferred from nearby atoms
+        of the reference site and the lattice vectors. The polarization is the displacement of
+        the atom from that expected position, expressed in fractional lattice coordinates (da, db).
+
+        Parameters
+        ----------
+        measure_ind : int
+            Index of the site whose polarization is measured.
+            This is the row index into the `positions_frac` passed to add_atoms().
+        reference_ind : int
+            Index of the reference site used to infer the expected positions.
+            This is the row index into the `positions_frac` passed to add_atoms().
+        reference_radius : float | None, default None
+            If provided, the reference neighbours of a measured atom are all reference atoms within
+            this radius (in pixels), truncated to the closest `max_neighbours` if that is also given.
+            Must be at least 1 px.
+            If None, the `max_neighbours` nearest reference atoms are used (k-nearest search).
+        min_neighbours : int | None, default 2
+            Minimum number of reference neighbours each measured atom must have.
+            With a radius search, a ValueError is raised if any atom has fewer.
+            With a k-nearest search, must be >= 2.
+        max_neighbours : int | None, default None
+            Maximum number of reference neighbours per atom.
+            Required when `reference_radius` is None, and must then be >= 2.
+
+        Returns
+        -------
+        self : Lattice
+            Returns the same object, modified in-place.
+
+        Raises
+        ------
+        ValueError
+            - If define_lattice_vectors() or add_atoms() has not been called.
+            - If `measure_ind` or `reference_ind` is not a valid site index.
+            - If neither `reference_radius` nor `max_neighbours` is given.
+            - If `reference_radius` < 1.
+            - If k-nearest search is used and `min_neighbours` or `max_neighbours` is missing or < 2.
+            - If `min_neighbours` > `max_neighbours`.
+            - If the lattice vectors are singular.
+            - If a radius search finds fewer than `min_neighbours` for any atom.
+            - If no measured atom has any reference neighbour.
+
+        Warns
+        -----
+        UserWarning
+            - If the measured or reference site has no atoms. An empty polarization is stored.
+            - If some measured atoms have no reference neighbours. Their polarization is set to zero.
+
+        Side Effects
+        ------------
+        self.polarization : Vector
+            shape=(1,), fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind").
+            self.polarization[0] holds one row per atom of the measured site:
+            - x, y: pixel coordinates of the atom (x is row, y is column; origin at top-left)
+            - a, b: fractional lattice indices of the atom
+            - da, db: polarization as a fractional displacement along u and v
+        self._pol_meas_ref_ind : tuple[int, int]
+            (measure_ind, reference_ind), used to draw the polarization legend.
+        self._most_common_neighbours : NDArray, shape (K, 2)
+            The most frequent fractional offsets (a - a_i, b - b_i) between a measured atom and
+            its reference neighbours, used to draw the polarization legend.
+        Sets self.default_plot to "polarization".
+
+        Notes
+        -----
+        - Lattice vectors are taken from self._lat and are in pixel units, with L = [u v] as columns.
+        - For a measured atom at position r with fractional indices (a, b), and its reference
+          neighbours at positions r_i with fractional indices (a_i, b_i), the expected position is
+              r_expected = mean_i( r_i + L @ [a - a_i, b - b_i] )
+          and the polarization is
+              [da, db] = L^{-1} @ (r - r_expected).
+        """
+        from collections import Counter
+
+        from scipy.spatial import cKDTree
+
+        # VALIDATION: Check that lattice vectors and atoms exist
+        if not hasattr(self, "_lat") or self._lat is None:
+            raise ValueError(
+                "Lattice vectors have not been fitted. Please call define_lattice_vectors() first."
+            )
+        if not hasattr(self, "atoms"):
+            raise ValueError("No atoms found. Call add_atoms() first.")
+
+        measure_ind = int(measure_ind)
+        reference_ind = int(reference_ind)
+        for name, ind in (("measure_ind", measure_ind), ("reference_ind", reference_ind)):
+            if not 0 <= ind < self._num_sites:
+                raise ValueError(f"{name} must be between 0 and {self._num_sites - 1}, got {ind}.")
+
+        # VALIDATION: Neighbour search parameters
+        if reference_radius is None and max_neighbours is None:
+            raise ValueError("Either reference_radius or max_neighbours must be passed.")
+        if reference_radius is not None and reference_radius < 1:
+            raise ValueError(
+                f"reference_radius must be atleast 1 pixel. You have passed : {reference_radius}"
+            )
+        if reference_radius is None:
+            if min_neighbours is None or max_neighbours is None:
+                raise ValueError(
+                    "min_neighbours and max_neighbours should be specified if reference_radius is None"
+                )
+            if min_neighbours < 2 or max_neighbours < 2:
+                raise ValueError(
+                    "Must use atleast 2 nearest neighbours to calculate the Polarization"
+                )
+        if (
+            min_neighbours is not None
+            and max_neighbours is not None
+            and min_neighbours > max_neighbours
+        ):
+            raise ValueError("'min_neighbours' cannot be larger than 'max_neighbours'")
+
+        # Lattice transformation matrix: [u | v] converts fractional coords to pixel coords
+        _, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        L = np.column_stack((u, v))
+        try:
+            L_inv = np.linalg.inv(L)
+        except np.linalg.LinAlgError:
+            raise ValueError("Lattice vectors are singular and cannot be inverted.")
+
+        polarization = Vector.from_shape(
+            shape=(1,),
+            fields=["x", "y", "a", "b", "da", "db"],
+            units=["px", "px", "ind", "ind", "ind", "ind"],
+            name="polarization",
+        )
+
+        # EMPTY SITES: store an empty polarization instead of failing
+        for name, ind in (("measure_ind", measure_ind), ("reference_ind", reference_ind)):
+            cell = self.atoms[ind].array
+            if isinstance(cell, list) or cell is None or cell.size == 0:
+                import warnings
+
+                warnings.warn(f"Site {ind} ({name}) has no atoms. Storing an empty polarization.")
+                self.polarization = polarization
+                self._pol_meas_ref_ind = (measure_ind, reference_ind)
+                self._most_common_neighbours = np.zeros((0, 2), dtype=float)
+                self.default_plot = "polarization"
+                return self
+
+        def site_field(ind: int, field: str) -> np.ndarray:
+            """Return one field of one site as a float array of shape (N,)."""
+            return self.atoms[ind].select_fields(field).array[:, 0].astype(float)
+
+        x_meas, y_meas = site_field(measure_ind, "x"), site_field(measure_ind, "y")
+        a_meas, b_meas = site_field(measure_ind, "a"), site_field(measure_ind, "b")
+        x_ref, y_ref = site_field(reference_ind, "x"), site_field(reference_ind, "y")
+        a_ref, b_ref = site_field(reference_ind, "a"), site_field(reference_ind, "b")
+
+        query_coords = np.column_stack((x_meas, y_meas))
+        ref_coords = np.column_stack((x_ref, y_ref))
+        tree = cKDTree(ref_coords)
+
+        # NEIGHBOUR SEARCH
+        # neighbour_idxs[i] holds indices into the reference site, sorted by distance
+        neighbour_idxs = []
+        if reference_radius is not None:
+            neighbour_lists = tree.query_ball_point(query_coords, r=reference_radius, workers=-1)
+            for i, neighbours in enumerate(neighbour_lists):
+                neighbours = np.asarray(neighbours, dtype=int)
+                distances = np.linalg.norm(ref_coords[neighbours] - query_coords[i], axis=1)
+                sorted_idx = neighbours[np.argsort(distances)]
+                if max_neighbours is not None:
+                    sorted_idx = sorted_idx[:max_neighbours]
+                neighbour_idxs.append(sorted_idx)
+
+            lengths = np.array([len(idx) for idx in neighbour_idxs])
+            if min_neighbours is not None and np.any(lengths < min_neighbours):
+                raise ValueError(
+                    "Failed to calculate enough nearest neighbours. Increase the reference_radius"
+                )
+        else:
+            dist_array, idx_array = tree.query(query_coords, k=max_neighbours, workers=-1)
+            # Missing neighbours (fewer reference atoms than k) are returned with infinite distance
+            finite_mask = np.isfinite(dist_array)
+            neighbour_idxs = [idx_array[i][finite_mask[i]] for i in range(len(query_coords))]
+
+        # NEIGHBOUR CHECKING
+        lengths = np.array([len(idx) for idx in neighbour_idxs])
+        if not np.any(lengths > 0):
+            raise ValueError(
+                "Failed to calculate nearest neighbours for all atoms. Increase reference_radius."
+            )
+        if not np.all(lengths > 0):
+            import warnings
+
+            warnings.warn(
+                f"{np.sum(lengths == 0)} atoms do not have any neighbours identified. "
+                "Their polarization is set to zero. Try increasing reference_radius."
+            )
+
+        # DISPLACEMENT CALCULATION
+        displacement = np.zeros((2, len(query_coords)))  # pixel displacements, rows (x, y)
+        neighbour_offsets = []  # fractional offsets (a - a_i, b - b_i), one (n, 2) array per atom
+        for i, nbr_idx in enumerate(neighbour_idxs):
+            if len(nbr_idx) == 0 or (min_neighbours is not None and len(nbr_idx) < min_neighbours):
+                continue
+            nbr_idx = nbr_idx.astype(int)
+
+            fractional_diff = np.array(
+                [a_meas[i] - a_ref[nbr_idx], b_meas[i] - b_ref[nbr_idx]]
+            )  # (2, n_neighbours)
+            neighbour_offsets.append(fractional_diff.T)
+
+            # Expected position predicted by each neighbour, averaged for robustness
+            expected_positions = np.array([x_ref[nbr_idx], y_ref[nbr_idx]]) + L @ fractional_diff
+            displacement[:, i] = query_coords[i] - expected_positions.mean(axis=1)
+
+        # Convert displacements to fractional coordinates
+        da, db = L_inv @ displacement
+
+        # MOST COMMON NEIGHBOUR OFFSETS (used by the polarization legend)
+        most_common_neighbours = np.zeros((0, 2), dtype=float)
+        if neighbour_offsets:
+            max_neighbours_found = max(len(offsets) for offsets in neighbour_offsets)
+            counter = Counter(tuple(row) for offsets in neighbour_offsets for row in offsets)
+            most_common_neighbours = np.array(
+                [offset for offset, _ in counter.most_common(max_neighbours_found)], dtype=float
+            )
+
+        # STORE RESULTS
+        polarization[0] = np.column_stack((x_meas, y_meas, a_meas, b_meas, da, db))
+        self.polarization = polarization
+        self._pol_meas_ref_ind = (measure_ind, reference_ind)
+        self._most_common_neighbours = most_common_neighbours
+        self.default_plot = "polarization"
+
+        return self
+
     ### --- Plot dispatcher ---
     def plot(self, kind: str | None = None, show_docstring: bool = False, **kwargs):
         """
@@ -1230,6 +1473,11 @@ class Lattice(AutoSerialize):
             "atoms"
                 Atom positions overlaid on the image.
                 Call after add_atoms() or refine_atoms().
+
+            "polarization"
+                Polarization vectors overlaid on the image, with a color wheel legend.
+                Pass show_legend=True to also draw the reference-neighbour diagram.
+                Call after measure_polarization().
 
         show_docstring : bool, default False
             If True, return formatted signature and docstring of the plotting
@@ -1258,6 +1506,7 @@ class Lattice(AutoSerialize):
             lat.plot(kind="lattice_vectors")
             lat.plot(kind="atoms")
             lat.plot(kind="atoms", show_docstring=True)
+            lat.plot(kind="polarization", show_legend=True)
         """
         if not hasattr(self, "default_plot") or kind in ["image", "dataset"]:
             from quantem.core.visualization import show_2d
