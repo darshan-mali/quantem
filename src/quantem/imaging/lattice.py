@@ -1449,6 +1449,449 @@ class Lattice(AutoSerialize):
 
         return self
 
+    def calculate_order_parameter(
+        self,
+        num_phases: int = 2,
+        phase_polarization_peak_array: NDArray | None = None,
+        refine_means: bool = True,
+        refine_means_direction: bool = True,
+        gmm_covariance_type: str = "full",
+        num_restarts: int = 1,
+        spatial_divergence: bool = False,
+        spatial_divergence_sigma: float | None = None,
+        spatial_divergence_sigma_units: str = "pixels",
+        spatial_average: bool = False,
+        spatial_averaging_sigma: float | None = None,
+        sigma_units: str = "pixels",
+        torch_device: str = "cpu",
+        verbose: bool = False,
+    ) -> "Lattice":
+        """
+        Classify the measured polarization into phases with a Gaussian Mixture Model (GMM).
+
+        By default a 2D GMM is fitted to the fractional polarization (da, db) of every atom.
+        With `spatial_divergence=True`, a 1D GMM is instead fitted to a local divergence metric
+        that measures how much each atom's polarization differs from its neighbours'.
+        The order parameter of each atom is its posterior membership probability for every phase.
+
+        Parameters
+        ----------
+        num_phases : int, default 2
+            Number of GMM components (phases). Must be >= 1.
+        phase_polarization_peak_array : NDArray | None, default None
+            Phase centers in (da, db) space, shape (num_phases, 2). Used as the GMM means in
+            the 2D mode (see `refine_means` and `refine_means_direction`).
+            Ignored with a warning when `spatial_divergence=True`.
+        refine_means : bool, default True
+            If False, the GMM means are fixed to `phase_polarization_peak_array`, which is then
+            required, and only the covariances and weights are fitted.
+        refine_means_direction : bool, default True
+            If False (and `refine_means` is True), a DirectionalGMM initialized from
+            `phase_polarization_peak_array` is used, which clusters primarily by the direction
+            of the polarization.
+        gmm_covariance_type : str, default "full"
+            One of "full", "diag", "spherical", "tied".
+        num_restarts : int, default 1
+            Number of GMM fits. The fit with the highest mean classification certainty
+            (mean of the maximum phase probability of each atom) is kept.
+        spatial_divergence : bool, default False
+            If True, fit a 1D GMM to the local divergence of each atom,
+                divergence_i = mean_j |P_j - P_i|   (pixels),
+            over the neighbours j within 3 * `spatial_divergence_sigma`, where P is the
+            polarization in pixels.
+        spatial_divergence_sigma : float | None, default None
+            Neighbourhood parameter for the divergence. Required when `spatial_divergence=True`.
+        spatial_divergence_sigma_units : str, default "pixels"
+            Units of `spatial_divergence_sigma`: "pixels", or "unit_cell" to search for
+            neighbours in fractional (a, b) coordinates.
+        spatial_average : bool, default False
+            If True, spatially smooth the result after fitting with Gaussian weights
+            exp(-d^2 / (2 sigma^2)) over neighbours within 3 sigma.
+            In the 2D mode the polarization is averaged and the probabilities are re-predicted
+            with the fitted GMM. In the divergence mode the probabilities are averaged directly.
+        spatial_averaging_sigma : float | None, default None
+            Gaussian width for `spatial_average`. Required when `spatial_average=True`.
+        sigma_units : str, default "pixels"
+            Units of `spatial_averaging_sigma`: "pixels", or "unit_cell" for multiples of the
+            mean lattice vector length.
+        torch_device : str, default "cpu"
+            Torch device used by the GMM ("cpu", "cuda", "cuda:0", ...).
+        verbose : bool, default False
+            If True, print the means and classification error of every fit.
+
+        Returns
+        -------
+        self : Lattice
+            Returns the same object, modified in-place.
+
+        Raises
+        ------
+        ValueError
+            - If measure_polarization() has not been called.
+            - If `num_phases` or `num_restarts` is not an integer >= 1.
+            - If `gmm_covariance_type` is not a valid covariance type.
+            - If `phase_polarization_peak_array` does not have shape (num_phases, 2).
+            - If `refine_means=False` without `phase_polarization_peak_array` (2D mode).
+            - If a required sigma is missing or not positive, or its units are invalid.
+            - If there are fewer atoms than `num_phases`.
+
+        Warns
+        -----
+        UserWarning
+            - If the polarization is empty. An empty order parameter is stored.
+            - If `phase_polarization_peak_array` is passed with `spatial_divergence=True`.
+
+        Side Effects
+        ------------
+        self.gmm : TorchGMM | None
+            The fitted GMM (None if the polarization is empty).
+        self._polarization_means : NDArray
+            GMM means, shape (num_phases, 2) in the 2D mode or (num_phases, 1) in the
+            divergence mode.
+        self._order_parameter_probabilities : NDArray, shape (N, num_phases)
+            Phase probabilities of each atom, in the row order of self.polarization[0].
+        self._order_parameter_divergence : NDArray | None
+            Divergence of each atom, shape (N,), in the divergence mode. None otherwise.
+        self._order_parameter_settings : dict
+            num_phases, covariance_type, spatial_divergence and spatial_average,
+            used by the order parameter plots.
+        Sets self.default_plot to "order_parameter".
+
+        Examples
+        --------
+        ::
+
+            lat.measure_polarization(measure_ind=1, reference_ind=0, reference_radius=30)
+            lat.calculate_order_parameter(num_phases=2)
+            lat.plot(kind="gmm_classification")
+            lat.plot(kind="order_parameter", show_phase_references=True)
+        """
+        import copy
+        import warnings
+
+        from quantem.imaging.torch_gmm import DirectionalGMM, FixedMeansGMM, TorchGMM
+
+        # VALIDATION: polarization and fitting parameters
+        if not hasattr(self, "polarization"):
+            raise ValueError("No polarization found. Call measure_polarization() first.")
+        for name, value in (("num_phases", num_phases), ("num_restarts", num_restarts)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+                raise ValueError(f"{name} must be an integer >= 1, got {value}.")
+        num_phases = int(num_phases)
+        num_restarts = int(num_restarts)
+        if gmm_covariance_type not in ("full", "diag", "spherical", "tied"):
+            raise ValueError(
+                "gmm_covariance_type must be one of 'full', 'diag', 'spherical', 'tied', "
+                f"got {gmm_covariance_type!r}."
+            )
+
+        if phase_polarization_peak_array is not None:
+            phase_polarization_peak_array = np.asarray(phase_polarization_peak_array, dtype=float)
+            if phase_polarization_peak_array.shape != (num_phases, 2):
+                raise ValueError(
+                    f"phase_polarization_peak_array should have shape ({num_phases}, 2), "
+                    f"got {phase_polarization_peak_array.shape}."
+                )
+            if spatial_divergence:
+                warnings.warn(
+                    "phase_polarization_peak_array is ignored when spatial_divergence=True."
+                )
+        elif not refine_means and not spatial_divergence:
+            raise ValueError("phase_polarization_peak_array must be given if refine_means=False.")
+
+        # VALIDATION: spatial parameters
+        for enabled, sigma_name, sigma, units_name, units in (
+            (
+                spatial_divergence,
+                "spatial_divergence_sigma",
+                spatial_divergence_sigma,
+                "spatial_divergence_sigma_units",
+                spatial_divergence_sigma_units,
+            ),
+            (
+                spatial_average,
+                "spatial_averaging_sigma",
+                spatial_averaging_sigma,
+                "sigma_units",
+                sigma_units,
+            ),
+        ):
+            if not enabled:
+                continue
+            if sigma is None:
+                raise ValueError(f"{sigma_name} must be given.")
+            if sigma <= 0:
+                raise ValueError(f"{sigma_name} must be positive, got {sigma}.")
+            if units not in ("pixels", "unit_cell"):
+                raise ValueError(f"{units_name} must be 'pixels' or 'unit_cell', got {units!r}.")
+
+        settings = {
+            "num_phases": num_phases,
+            "covariance_type": gmm_covariance_type,
+            "spatial_divergence": bool(spatial_divergence),
+            "spatial_average": bool(spatial_average),
+        }
+        num_dims = 1 if spatial_divergence else 2
+
+        # EMPTY POLARIZATION: store an empty order parameter instead of failing
+        cell = self.polarization[0].array
+        if isinstance(cell, list) or cell is None or cell.size == 0:
+            warnings.warn("Polarization is empty. Storing an empty order parameter.")
+            self.gmm = None
+            self._polarization_means = np.full((num_phases, num_dims), np.nan)
+            self._order_parameter_probabilities = np.zeros((0, num_phases))
+            self._order_parameter_divergence = np.zeros(0) if spatial_divergence else None
+            self._order_parameter_settings = settings
+            self.default_plot = "order_parameter"
+            return self
+
+        def pol_field(field: str) -> np.ndarray:
+            """Return one polarization field as a float array of shape (N,)."""
+            return self.polarization[0].select_fields(field).array[:, 0].astype(float)
+
+        pixel_coords = np.column_stack((pol_field("x"), pol_field("y")))
+        frac_coords = np.column_stack((pol_field("a"), pol_field("b")))
+        frac_polarization = np.column_stack((pol_field("da"), pol_field("db")))
+
+        n_samples = len(frac_polarization)
+        if n_samples < num_phases:
+            raise ValueError(
+                f"Number of atoms ({n_samples}) must be >= num_phases ({num_phases})."
+            )
+
+        # Rows of L are the lattice vectors, so frac @ L = da * u + db * v in pixels
+        _, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        L = np.stack((u, v))
+        cartesian_polarization = frac_polarization @ L
+
+        # GMM DATA AND MODEL
+        divergence = None
+        if spatial_divergence:
+            divergence = self._spatial_divergence_order_parameter(
+                pixel_coords,
+                frac_coords,
+                cartesian_polarization,
+                spatial_divergence_sigma,  # type: ignore[arg-type]
+                spatial_divergence_sigma_units,
+            )
+            data = divergence.reshape(-1, 1)
+            gmm = TorchGMM(
+                n_components=num_phases, covariance_type=gmm_covariance_type, device=torch_device
+            )
+        else:
+            data = frac_polarization
+            if phase_polarization_peak_array is None:
+                gmm = TorchGMM(
+                    n_components=num_phases,
+                    covariance_type=gmm_covariance_type,
+                    device=torch_device,
+                )
+            elif not refine_means:
+                gmm = FixedMeansGMM(
+                    fixed_means=phase_polarization_peak_array,
+                    covariance_type=gmm_covariance_type,
+                    device=torch_device,
+                )
+            elif not refine_means_direction:
+                gmm = DirectionalGMM(
+                    n_components=num_phases,
+                    covariance_type=gmm_covariance_type,
+                    means_init=phase_polarization_peak_array,
+                    device=torch_device,
+                )
+            else:
+                gmm = TorchGMM(
+                    n_components=num_phases,
+                    covariance_type=gmm_covariance_type,
+                    means_init=phase_polarization_peak_array,
+                    device=torch_device,
+                )
+
+        # GMM FITTING: keep the most certain of num_restarts fits
+        best_gmm, best_probabilities, best_error = None, None, np.inf
+        for restart in range(num_restarts):
+            gmm.fit(data)
+            probabilities = gmm.predict_proba(data)  # (N, num_phases)
+            error = 1.0 - probabilities.max(axis=1).mean()
+
+            if verbose:
+                print(f"Restart {restart + 1}/{num_restarts}:")
+                print(f"    Means: \n{gmm.means_}")
+                print(f"    Error: {error:.4f}")
+
+            if best_gmm is None or error < best_error:
+                best_error, best_probabilities = error, probabilities
+                best_gmm = copy.deepcopy(gmm) if num_restarts > 1 else gmm
+
+        if verbose and num_restarts > 1:
+            print("Best result:")
+            print(f"    Means: \n{best_gmm.means_}")  # type: ignore[union-attr]
+            print(f"    Error: {best_error:.4f}")
+
+        # POST-FIT SPATIAL AVERAGING
+        probabilities = best_probabilities
+        if spatial_average:
+            if spatial_divergence:
+                probabilities = self._spatial_average_probabilities(
+                    pixel_coords,
+                    best_probabilities,  # type: ignore[arg-type]
+                    spatial_averaging_sigma,  # type: ignore[arg-type]
+                    sigma_units,
+                )
+            else:
+                averaged_cartesian = self._spatial_average_polarization(
+                    pixel_coords,
+                    frac_coords,
+                    cartesian_polarization,
+                    spatial_averaging_sigma,  # type: ignore[arg-type]
+                    sigma_units,
+                )
+                try:
+                    averaged_frac = averaged_cartesian @ np.linalg.inv(L)
+                except np.linalg.LinAlgError:
+                    raise ValueError("Lattice vectors are singular and cannot be inverted.")
+                probabilities = best_gmm.predict_proba(averaged_frac)  # type: ignore[union-attr]
+
+        # STORE RESULTS
+        self.gmm = best_gmm
+        self._polarization_means = best_gmm.means_  # type: ignore[union-attr]
+        self._order_parameter_probabilities = probabilities
+        self._order_parameter_divergence = divergence
+        self._order_parameter_settings = settings
+        self.default_plot = "order_parameter"
+
+        return self
+
+    ### --- Order parameter helpers ---
+    def _spatial_divergence_order_parameter(
+        self,
+        pixel_coords: NDArray,
+        frac_coords: NDArray,
+        cartesian_polarization: NDArray,
+        sigma: float,
+        sigma_units: str = "pixels",
+    ) -> NDArray:
+        """
+        Local divergence of each atom: the mean distance (in pixels) between its polarization
+        and the polarization of every other atom within a radius of 3 * sigma.
+        Atoms without neighbours get a divergence of 0.
+
+        Parameters
+        ----------
+        pixel_coords, frac_coords : NDArray, shape (N, 2)
+            Atom positions in pixels (x, y) and in fractional lattice coordinates (a, b).
+        cartesian_polarization : NDArray, shape (N, 2)
+            Polarization of each atom in pixels.
+        sigma : float
+            Neighbourhood parameter, the search radius is 3 * sigma.
+        sigma_units : str, default "pixels"
+            "pixels" searches in pixel coordinates, "unit_cell" in fractional coordinates.
+
+        Returns
+        -------
+        divergence : NDArray, shape (N,)
+        """
+        from scipy.spatial import cKDTree
+
+        kdtree_coords = frac_coords if sigma_units == "unit_cell" else pixel_coords
+        tree = cKDTree(kdtree_coords)
+
+        divergence = np.zeros(len(kdtree_coords), dtype=float)
+        for i, neighbours in enumerate(tree.query_ball_point(kdtree_coords, r=3.0 * sigma)):
+            neighbours = [j for j in neighbours if j != i]
+            if neighbours:
+                diff = cartesian_polarization[neighbours] - cartesian_polarization[i]
+                divergence[i] = np.linalg.norm(diff, axis=1).mean()
+
+        return divergence
+
+    def _spatial_average_polarization(
+        self,
+        pixel_coords: NDArray,
+        frac_coords: NDArray,
+        cartesian_polarization: NDArray,
+        sigma: float,
+        sigma_units: str = "pixels",
+    ) -> NDArray:
+        """
+        Gaussian-weighted average of each atom's polarization with its neighbours.
+
+        Neighbours are searched within 3 * sigma (in fractional coordinates if
+        sigma_units="unit_cell", otherwise in pixels) and weighted by
+        exp(-d^2 / (2 sigma_px^2)) of their pixel distance d. The atom itself has weight 1.
+
+        Returns
+        -------
+        averaged : NDArray, shape (N, 2)
+            Averaged polarization in pixels.
+        """
+        from scipy.spatial import cKDTree
+
+        if sigma_units == "unit_cell":
+            _, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+            kdtree_coords = frac_coords
+            sigma_px = sigma * (np.linalg.norm(u) + np.linalg.norm(v)) / 2.0
+        else:
+            kdtree_coords = pixel_coords
+            sigma_px = sigma
+        tree = cKDTree(kdtree_coords)
+
+        averaged = cartesian_polarization.astype(float).copy()
+        for i, neighbours in enumerate(tree.query_ball_point(kdtree_coords, r=3.0 * sigma)):
+            neighbours = [j for j in neighbours if j != i]
+            if not neighbours:
+                continue
+            pixel_dist = np.linalg.norm(pixel_coords[neighbours] - pixel_coords[i], axis=1)
+            weights = np.exp(-(pixel_dist**2) / (2.0 * sigma_px**2))
+            averaged[i] = (
+                cartesian_polarization[i] + weights @ cartesian_polarization[neighbours]
+            ) / (1.0 + weights.sum())
+
+        return averaged
+
+    def _spatial_average_probabilities(
+        self,
+        pixel_coords: NDArray,
+        probabilities: NDArray,
+        sigma: float,
+        sigma_units: str = "pixels",
+    ) -> NDArray:
+        """
+        Gaussian-weighted average of each atom's phase probabilities with its neighbours.
+
+        Neighbours within 3 * sigma_px are weighted by exp(-d^2 / (2 sigma_px^2)), the atom
+        itself has weight 1, and rows are renormalized to sum to 1. With
+        sigma_units="unit_cell", sigma_px = sigma * (|u| + |v|) / 2.
+
+        Returns
+        -------
+        smoothed : NDArray, shape (N, num_phases)
+        """
+        from scipy.spatial import cKDTree
+
+        if sigma_units == "unit_cell":
+            _, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+            sigma_px = sigma * (np.linalg.norm(u) + np.linalg.norm(v)) / 2.0
+        else:
+            sigma_px = sigma
+        tree = cKDTree(pixel_coords)
+
+        smoothed = probabilities.astype(float).copy()
+        for i, neighbours in enumerate(tree.query_ball_point(pixel_coords, r=3.0 * sigma_px)):
+            neighbours = [j for j in neighbours if j != i]
+            if not neighbours:
+                continue
+            pixel_dist = np.linalg.norm(pixel_coords[neighbours] - pixel_coords[i], axis=1)
+            weights = np.exp(-(pixel_dist**2) / (2.0 * sigma_px**2))
+            smoothed[i] = (probabilities[i] + weights @ probabilities[neighbours]) / (
+                1.0 + weights.sum()
+            )
+
+        row_sums = smoothed.sum(axis=1, keepdims=True)
+        smoothed /= np.where(row_sums == 0, 1.0, row_sums)
+
+        return smoothed
+
     ### --- Plot dispatcher ---
     def plot(self, kind: str | None = None, show_docstring: bool = False, **kwargs):
         """
@@ -1479,6 +1922,16 @@ class Lattice(AutoSerialize):
                 Pass show_legend=True to also draw the reference-neighbour diagram.
                 Call after measure_polarization().
 
+            "gmm_classification"
+                GMM fit in (da, db) space with density contours, centers and 2-sigma ellipses,
+                or a divergence histogram with the fitted components in divergence mode.
+                Call after calculate_order_parameter().
+
+            "order_parameter"
+                Atoms colored by phase probability overlaid on the image.
+                Pass show_phase_references=True to also draw a unit cell diagram per phase.
+                Call after calculate_order_parameter().
+
         show_docstring : bool, default False
             If True, return formatted signature and docstring of the plotting
             function instead of calling it. If False, call the function and
@@ -1507,6 +1960,7 @@ class Lattice(AutoSerialize):
             lat.plot(kind="atoms")
             lat.plot(kind="atoms", show_docstring=True)
             lat.plot(kind="polarization", show_legend=True)
+            lat.plot(kind="order_parameter", show_phase_references=True)
         """
         if not hasattr(self, "default_plot") or kind in ["image", "dataset"]:
             from quantem.core.visualization import show_2d

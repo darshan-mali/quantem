@@ -8,6 +8,7 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import load
 from quantem.imaging.lattice import Lattice
+from quantem.imaging.torch_gmm import DirectionalGMM, FixedMeansGMM, TorchGMM
 
 
 class TestLatticeInit:
@@ -838,8 +839,405 @@ class TestPlotPolarization:
             lattice.plot(kind="polarization")
 
 
+def _lattice_with_polarization_domains(noise: float = 0.005) -> Lattice:
+    """
+    Grid lattice whose measured site has da = +0.05 in the left half of the image (y < 100)
+    and da = -0.05 in the right half, with small Gaussian noise on da and db.
+    """
+    lattice = _grid_lattice_with_atoms()
+    lattice.measure_polarization(measure_ind=0, reference_ind=1, reference_radius=50.0)
+
+    arr = lattice.polarization[0].array.copy()
+    rng = np.random.default_rng(0)
+    left = arr[:, 1] < 100
+    arr[:, 4] = np.where(left, 0.05, -0.05) + rng.normal(scale=noise, size=len(arr))
+    arr[:, 5] = rng.normal(scale=noise, size=len(arr))
+    lattice.polarization[0] = arr
+    return lattice
+
+
+def _domain_accuracy(probabilities: np.ndarray, in_domain: np.ndarray) -> float:
+    """Fraction of atoms whose most likely phase matches the domain, up to label permutation."""
+    labels = np.argmax(probabilities, axis=1) == 1
+    return max(np.mean(labels == in_domain), np.mean(labels != in_domain))
+
+
+class TestCalculateOrderParameter:
+    """Test calculate_order_parameter method."""
+
+    @pytest.fixture
+    def lattice_with_domains(self):
+        return _lattice_with_polarization_domains()
+
+    def test_returns_self_and_sets_state(self, lattice_with_domains: Lattice):
+        """Test calculate_order_parameter chains and stores its results."""
+        result = lattice_with_domains.calculate_order_parameter(num_phases=2)
+        num_atoms = lattice_with_domains.polarization[0].array.shape[0]
+
+        assert result is lattice_with_domains
+        assert lattice_with_domains.default_plot == "order_parameter"
+        assert isinstance(lattice_with_domains.gmm, TorchGMM)
+        assert lattice_with_domains._polarization_means.shape == (2, 2)
+        assert lattice_with_domains._order_parameter_probabilities.shape == (num_atoms, 2)
+        assert np.allclose(lattice_with_domains._order_parameter_probabilities.sum(axis=1), 1.0)
+        assert lattice_with_domains._order_parameter_divergence is None
+        assert lattice_with_domains._order_parameter_settings == {
+            "num_phases": 2,
+            "covariance_type": "full",
+            "spatial_divergence": False,
+            "spatial_average": False,
+        }
+
+    def test_separates_domains(self, lattice_with_domains: Lattice):
+        """Test the two polarization domains are classified into different phases."""
+        lattice_with_domains.calculate_order_parameter(num_phases=2)
+        left = lattice_with_domains.polarization[0].array[:, 1] < 100
+
+        assert _domain_accuracy(lattice_with_domains._order_parameter_probabilities, left) == 1.0
+        assert np.allclose(
+            np.sort(lattice_with_domains._polarization_means[:, 0]), [-0.05, 0.05], atol=0.01
+        )
+
+    @pytest.mark.parametrize("covariance_type", ["full", "diag", "spherical", "tied"])
+    def test_covariance_types(self, lattice_with_domains: Lattice, covariance_type):
+        """Test every covariance type fits and gives normalized probabilities."""
+        lattice_with_domains.calculate_order_parameter(
+            num_phases=2, gmm_covariance_type=covariance_type
+        )
+        probabilities = lattice_with_domains._order_parameter_probabilities
+
+        assert np.allclose(probabilities.sum(axis=1), 1.0)
+        assert lattice_with_domains.gmm.covariances_.shape == (2, 2, 2)
+
+    @pytest.mark.parametrize("num_phases", [1, 3, 4])
+    def test_num_phases(self, lattice_with_domains: Lattice, num_phases):
+        """Test other numbers of phases give probabilities of the matching shape."""
+        lattice_with_domains.calculate_order_parameter(num_phases=num_phases)
+        probabilities = lattice_with_domains._order_parameter_probabilities
+
+        assert probabilities.shape[1] == num_phases
+        assert np.allclose(probabilities.sum(axis=1), 1.0)
+
+    def test_num_restarts(self, lattice_with_domains: Lattice, capsys):
+        """Test several restarts keep a valid fit and print progress when verbose."""
+        lattice_with_domains.calculate_order_parameter(num_phases=2, num_restarts=3, verbose=True)
+        left = lattice_with_domains.polarization[0].array[:, 1] < 100
+
+        assert "Restart 3/3" in capsys.readouterr().out
+        assert _domain_accuracy(lattice_with_domains._order_parameter_probabilities, left) == 1.0
+
+    def test_initial_means(self, lattice_with_domains: Lattice):
+        """Test the GMM variant chosen from phase_polarization_peak_array and refine flags."""
+        peaks = np.array([[0.05, 0.0], [-0.05, 0.0]])
+
+        lattice_with_domains.calculate_order_parameter(phase_polarization_peak_array=peaks)
+        assert type(lattice_with_domains.gmm) is TorchGMM
+
+        lattice_with_domains.calculate_order_parameter(
+            phase_polarization_peak_array=peaks, refine_means=False
+        )
+        assert isinstance(lattice_with_domains.gmm, FixedMeansGMM)
+        assert np.allclose(lattice_with_domains._polarization_means, peaks, atol=1e-6)
+
+        lattice_with_domains.calculate_order_parameter(
+            phase_polarization_peak_array=peaks, refine_means_direction=False
+        )
+        assert isinstance(lattice_with_domains.gmm, DirectionalGMM)
+
+    @pytest.mark.parametrize("sigma,units", [(40.0, "pixels"), (0.5, "unit_cell")])
+    def test_spatial_divergence(self, lattice_with_domains: Lattice, sigma, units):
+        """Test the divergence mode fits a 1D GMM to a non-negative divergence."""
+        with pytest.warns(UserWarning, match="ignored"):
+            lattice_with_domains.calculate_order_parameter(
+                num_phases=2,
+                phase_polarization_peak_array=np.zeros((2, 2)),
+                spatial_divergence=True,
+                spatial_divergence_sigma=sigma,
+                spatial_divergence_sigma_units=units,
+            )
+        num_atoms = lattice_with_domains.polarization[0].array.shape[0]
+
+        assert lattice_with_domains._order_parameter_divergence.shape == (num_atoms,)
+        assert np.all(lattice_with_domains._order_parameter_divergence >= 0)
+        assert lattice_with_domains._polarization_means.shape == (2, 1)
+        assert lattice_with_domains._order_parameter_settings["spatial_divergence"]
+
+    def test_divergence_is_largest_at_domain_wall(self):
+        """Atoms next to the domain wall have a larger divergence than atoms inside a domain."""
+        lattice = _lattice_with_polarization_domains(noise=0.0)
+        lattice.calculate_order_parameter(spatial_divergence=True, spatial_divergence_sigma=15.0)
+        y = lattice.polarization[0].array[:, 1]
+        divergence = lattice._order_parameter_divergence
+
+        # Atom columns sit at y = 15, 55, 95, 135, 175, so the wall is between 95 and 135
+        wall = np.abs(y - 115) < 25
+        assert divergence[wall].min() > divergence[~wall].max()
+
+    @pytest.mark.parametrize("spatial_divergence", [False, True])
+    @pytest.mark.parametrize("sigma,units", [(40.0, "pixels"), (1.0, "unit_cell")])
+    def test_spatial_average(
+        self, lattice_with_domains: Lattice, spatial_divergence, sigma, units
+    ):
+        """Test spatial averaging in both modes gives normalized probabilities."""
+        lattice_with_domains.calculate_order_parameter(
+            num_phases=2,
+            spatial_divergence=spatial_divergence,
+            spatial_divergence_sigma=40.0,
+            spatial_average=True,
+            spatial_averaging_sigma=sigma,
+            sigma_units=units,
+        )
+        probabilities = lattice_with_domains._order_parameter_probabilities
+
+        assert np.all((probabilities >= 0) & (probabilities <= 1))
+        assert np.allclose(probabilities.sum(axis=1), 1.0)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"num_phases": 0},
+            {"num_phases": 2.0},
+            {"num_restarts": 0},
+            {"gmm_covariance_type": "bad"},
+            {"phase_polarization_peak_array": np.zeros((3, 2))},
+            {"refine_means": False},
+            {"spatial_divergence": True},
+            {"spatial_divergence": True, "spatial_divergence_sigma": -1.0},
+            {
+                "spatial_divergence": True,
+                "spatial_divergence_sigma": 1.0,
+                "spatial_divergence_sigma_units": "nm",
+            },
+            {"spatial_average": True},
+            {"spatial_average": True, "spatial_averaging_sigma": 1.0, "sigma_units": "nm"},
+            {"num_phases": 1000},
+        ],
+    )
+    def test_invalid_parameters(self, lattice_with_domains: Lattice, kwargs):
+        """Test invalid parameters raise ValueError."""
+        with pytest.raises(ValueError):
+            lattice_with_domains.calculate_order_parameter(**kwargs)
+
+    def test_requires_polarization(self):
+        """Test calculate_order_parameter raises before measure_polarization."""
+        lattice = _grid_lattice_with_atoms()
+        with pytest.raises(ValueError, match=r"measure_polarization\(\)"):
+            lattice.calculate_order_parameter()
+
+    def test_empty_polarization(self, lattice_with_domains: Lattice):
+        """Test an empty polarization stores an empty order parameter and warns."""
+        lattice_with_domains.polarization[0] = np.zeros((0, 6))
+
+        with pytest.warns(UserWarning, match="Polarization is empty"):
+            result = lattice_with_domains.calculate_order_parameter(num_phases=3)
+
+        assert result is lattice_with_domains
+        assert lattice_with_domains.gmm is None
+        assert lattice_with_domains._order_parameter_probabilities.shape == (0, 3)
+        assert lattice_with_domains.default_plot == "order_parameter"
+
+
+class TestCalculateOrderParameterSynGT:
+    """
+    End-to-end test of add_atoms -> refine_atoms -> measure_polarization ->
+    calculate_order_parameter on a synthetic image with two polarization domains.
+    """
+
+    def test_recovers_known_domains(self):
+        rng = np.random.default_rng(5)
+
+        H, W = 160, 160
+        r0 = np.array([20.0, 20.0])
+        u = np.array([20.0, 0.0])
+        v = np.array([0.0, 20.0])
+        positions_frac = np.array([[0.0, 0.0], [0.5, 0.5]])
+        site_amplitudes = [1.0, 0.6]
+        wall_y = 80.0
+
+        # Site 1 is displaced by +1.5 px along u left of the wall and -1.5 px right of it
+        shift_px = 1.5
+        da_true = shift_px / np.linalg.norm(u)
+
+        image = np.zeros((H, W))
+        rr, cc = np.mgrid[0:H, 0:W]
+        for site_idx, ((fa, fb), amp) in enumerate(zip(positions_frac, site_amplitudes)):
+            for a in range(-1, 9):
+                for b in range(-1, 9):
+                    pos = r0 + (a + fa) * u + (b + fb) * v
+                    if site_idx == 1:
+                        pos = pos + np.array([shift_px if pos[1] < wall_y else -shift_px, 0.0])
+                    image += amp * np.exp(
+                        -0.5 * ((rr - pos[0]) ** 2 + (cc - pos[1]) ** 2) / 1.5**2
+                    )
+        image += rng.normal(scale=0.01, size=image.shape)
+
+        lattice = Lattice.from_data(image, normalize_min=False, normalize_max=False)
+        lattice.define_lattice_vectors(origin=r0, u=u, v=v, refine_lattice=False)
+        lattice.add_atoms(positions_frac, intensity_radius=3.0, edge_min_dist_px=6)
+        lattice.refine_atoms(fit_radius=4.0, max_move_px=3.0)
+        lattice.measure_polarization(
+            measure_ind=1, reference_ind=0, reference_radius=None, max_neighbours=4
+        )
+        lattice.calculate_order_parameter(num_phases=2)
+
+        left = lattice.polarization[0].select_fields("y").array[:, 0] < wall_y
+        assert 0 < left.sum() < left.size
+        assert _domain_accuracy(lattice._order_parameter_probabilities, left) == 1.0
+        assert np.allclose(
+            np.sort(lattice._polarization_means[:, 0]), [-da_true, da_true], atol=0.01
+        )
+        assert np.all(np.abs(lattice._polarization_means[:, 1]) < 0.01)
+
+
+class TestPlotOrderParameter:
+    """Test plot(kind='gmm_classification') and plot(kind='order_parameter')."""
+
+    @pytest.fixture(autouse=True)
+    def close_figures(self):
+        yield
+        plt.close("all")
+
+    @pytest.fixture
+    def classified_lattice(self):
+        return _lattice_with_polarization_domains().calculate_order_parameter(num_phases=2)
+
+    def test_plot_returns_figure(self, classified_lattice: Lattice):
+        """Test both plots and the default plot return a figure."""
+        for kind in ["gmm_classification", "order_parameter"]:
+            fig, ax = classified_lattice.plot(kind=kind, returnfig=True)
+            assert isinstance(fig, Figure)
+            assert classified_lattice.plot(kind=kind) is None
+
+        fig, ax = classified_lattice.plot(returnfig=True)
+        assert isinstance(fig, Figure)
+
+    @pytest.mark.parametrize("num_phases,num_axes", [(2, 4), (3, 5), (4, 5)])
+    def test_plot_num_phases(self, num_phases, num_axes):
+        """Test both plots for several numbers of phases, with phase references."""
+        lattice = _lattice_with_polarization_domains().calculate_order_parameter(
+            num_phases=num_phases
+        )
+
+        fig, ax = lattice.plot(kind="gmm_classification", returnfig=True)
+        assert isinstance(fig, Figure)
+
+        fig, axs = lattice.plot(kind="order_parameter", show_phase_references=True, returnfig=True)
+        assert isinstance(fig, Figure)
+        assert len(axs) == num_axes
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"phase_colours": ["red", "blue"]},
+            {"phase_colours": "green"},
+            {"phase_colours": np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])},
+            {"clip_range": (-0.5, 0.5), "saturation_boost": 2.0},
+            {"show_colorbar": False},
+        ],
+    )
+    def test_plot_options(self, classified_lattice: Lattice, kwargs):
+        """Test optional parameters shared by both plots."""
+        for kind in ["gmm_classification", "order_parameter"]:
+            fig, ax = classified_lattice.plot(kind=kind, returnfig=True, **kwargs)
+            assert isinstance(fig, Figure)
+
+    def test_plot_order_parameter_options(self, classified_lattice: Lattice):
+        """Test order parameter plot specific parameters."""
+        fig, axs = classified_lattice.plot(
+            kind="order_parameter",
+            returnfig=True,
+            show_phase_references=True,
+            show_colorbar=False,
+            marker_size=10,
+            title="custom",
+            figsize=(8, 6),
+            reference_kwargs={"atom_size": 50, "arrow_scale_factor": 5.0, "adaptive_head": False},
+        )
+        assert isinstance(fig, Figure)
+        assert len(axs) == 3
+
+    def test_plot_invalid_phase_colours(self, classified_lattice: Lattice):
+        """Test invalid phase_colours raise ValueError."""
+        with pytest.raises(ValueError, match="phase_colours"):
+            classified_lattice.plot(kind="order_parameter", phase_colours=["red"])
+
+    def test_plot_divergence_mode(self):
+        """Test both plots in the divergence mode."""
+        lattice = _lattice_with_polarization_domains().calculate_order_parameter(
+            spatial_divergence=True, spatial_divergence_sigma=15.0
+        )
+
+        fig, ax = lattice.plot(kind="gmm_classification", returnfig=True)
+        assert isinstance(fig, Figure)
+
+        with pytest.warns(UserWarning, match="divergence mode"):
+            fig, ax = lattice.plot(
+                kind="order_parameter", show_phase_references=True, returnfig=True
+            )
+        assert isinstance(fig, Figure)
+
+    def test_plot_spatial_average_warns(self):
+        """Test the GMM plot warns that spatially averaged probabilities are shown."""
+        lattice = _lattice_with_polarization_domains().calculate_order_parameter(
+            spatial_average=True, spatial_averaging_sigma=20.0
+        )
+        with pytest.warns(UserWarning, match="spatially averaged"):
+            lattice.plot(kind="gmm_classification", returnfig=True)
+
+    def test_plot_empty_order_parameter(self, classified_lattice: Lattice):
+        """Test plotting an empty order parameter."""
+        classified_lattice.polarization[0] = np.zeros((0, 6))
+        with pytest.warns(UserWarning, match="Polarization is empty"):
+            classified_lattice.calculate_order_parameter()
+
+        for kind in ["gmm_classification", "order_parameter"]:
+            fig, ax = classified_lattice.plot(kind=kind, returnfig=True)
+            assert isinstance(fig, Figure)
+        fig, axs = classified_lattice.plot(
+            kind="order_parameter", show_phase_references=True, returnfig=True
+        )
+        assert isinstance(fig, Figure)
+
+    def test_plot_before_calculate_raises(self):
+        """Test the plots raise before calculate_order_parameter()."""
+        lattice = _lattice_with_polarization_domains()
+        for kind in ["gmm_classification", "order_parameter"]:
+            with pytest.raises(ValueError, match="calculate_order_parameter"):
+                lattice.plot(kind=kind)
+
+    def test_plot_after_polarization_changed_raises(self, classified_lattice: Lattice):
+        """Test the plots raise if the polarization was re-measured with a different size."""
+        classified_lattice.atoms[0] = classified_lattice.atoms[0].array[:-1]
+        classified_lattice.measure_polarization(
+            measure_ind=0, reference_ind=1, reference_radius=50.0
+        )
+        with pytest.raises(ValueError, match="calculate_order_parameter"):
+            classified_lattice.plot(kind="order_parameter")
+
+
 class TestLatticeSerialize:
     """Test Lattice Autoserialize implementation."""
+
+    @pytest.mark.parametrize("store", ["zip", "dir"])
+    def test_order_parameter_save_load(self, tmp_path, store):
+        """Test save/load of a lattice with a calculated order parameter."""
+        lattice = _lattice_with_polarization_domains().calculate_order_parameter(num_phases=2)
+
+        filepath = tmp_path / ("lattice.zip" if store == "zip" else "lattice_dir")
+        lattice.save(str(filepath), mode="w", store=store)
+        loaded = load(str(filepath))
+
+        assert np.allclose(
+            loaded._order_parameter_probabilities, lattice._order_parameter_probabilities
+        )
+        assert np.allclose(loaded._polarization_means, lattice._polarization_means)
+        assert loaded._order_parameter_settings == lattice._order_parameter_settings
+        assert np.allclose(
+            loaded.gmm.predict_proba(np.zeros((1, 2))), lattice.gmm.predict_proba(np.zeros((1, 2)))
+        )
+        fig, ax = loaded.plot(kind="order_parameter", returnfig=True)
+        assert isinstance(fig, Figure)
+        plt.close("all")
 
     @pytest.mark.parametrize("store", ["zip", "dir"])
     def test_lattice_save_load(self, tmp_path, store):

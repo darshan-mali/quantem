@@ -10,6 +10,10 @@ Registered plot names (callable via ``lattice.plot(kind=...)``)
   "atoms"             - image + detected/refined atom overlays (after add_atoms / refine_atoms)
   "polarization"      - image + polarization vectors, color wheel and optional
                         reference-neighbour legend (after measure_polarization)
+  "gmm_classification" - GMM fit in (da, db) space, or divergence histogram
+                        (after calculate_order_parameter)
+  "order_parameter"   - image + atoms colored by phase probability, with optional
+                        per-phase reference diagrams (after calculate_order_parameter)
 """
 
 import matplotlib.gridspec as gridspec
@@ -461,6 +465,394 @@ def plot_polarization(
         return None
 
 
+@_register("gmm_classification")
+def plot_gmm_classification(
+    lattice,
+    *,
+    returnfig: bool = False,
+    figax: tuple | None = None,
+    phase_colours=None,
+    clip_range: tuple[float, float] | None = None,
+    saturation_boost: float = 1.0,
+    contour_cmap: str = "gray_r",
+    contour_levels: int = 15,
+    gmm_center_colour=None,
+    gmm_ellipse_colour=None,
+    n_std: float = 2.0,
+    show_colorbar: bool = True,
+    divergence_hist_bins: int = 50,
+    figsize: tuple[float, float] | None = None,
+) -> None | tuple:
+    """
+    Visualize the GMM fitted by calculate_order_parameter().
+
+    In the 2D mode, the polarization (da, db) of every atom is drawn over its kernel density
+    estimate, colored by phase probability, with the GMM centers and n_std confidence ellipses.
+    In the divergence mode, a histogram of the divergence is drawn with the bars colored by
+    phase and the fitted Gaussian components overlaid.
+
+    Parameters
+    ----------
+    returnfig : bool, default False
+        If True, return (fig, ax) instead of displaying.
+    figax : tuple | None
+        (fig, ax) to draw on. If None, a new figure is created.
+    phase_colours : callable | color | sequence of colors | NDArray | None
+        Color of each phase: a function i -> RGB, a single color for all phases, or
+        num_phases colors (names or an RGB array of shape (num_phases, 3)).
+        If None, site_colors is used.
+    clip_range : tuple[float, float] | None
+        Order parameter range mapped to full saturation (2 and 3 phases).
+    saturation_boost : float, default 1.0
+        Multiplier on the color saturation.
+    contour_cmap : str, default "gray_r"
+        Colormap of the density contours (2D mode).
+    contour_levels : int, default 15
+        Number of density contour levels (2D mode).
+    gmm_center_colour, gmm_ellipse_colour : color | None
+        Colors of the GMM centers and ellipses (2D mode). If None, chosen by num_phases.
+    n_std : float, default 2.0
+        Size of the confidence ellipses in standard deviations (2D mode).
+    show_colorbar : bool, default True
+        If True, draw the 2-phase colorbar or 3-phase color triangle (2D mode).
+    divergence_hist_bins : int, default 50
+        Number of histogram bins (divergence mode).
+    figsize : tuple | None
+        Figure size if a new figure is created.
+    """
+    import warnings
+
+    from matplotlib.ticker import PercentFormatter
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    from scipy.stats import gaussian_kde, norm
+
+    _check_order_parameter(lattice)
+    settings = lattice._order_parameter_settings
+    num_phases = settings["num_phases"]
+    probabilities = lattice._order_parameter_probabilities
+    colours = _resolve_phase_colours(phase_colours, num_phases)
+
+    if figax is not None:
+        fig, ax = figax
+    else:
+        default_figsize = (8, 5) if settings["spatial_divergence"] else (8, 7)
+        fig, ax = plt.subplots(figsize=figsize or default_figsize)
+
+    if probabilities.shape[0] == 0:
+        ax.set_title("GMM classification (no data)")
+        return (fig, ax) if returnfig else None
+
+    gmm = lattice.gmm
+    means = np.asarray(lattice._polarization_means, dtype=float)
+    covariances = np.asarray(gmm.covariances_, dtype=float)  # (K, D, D)
+
+    if settings["spatial_divergence"]:
+        divergence = lattice._order_parameter_divergence
+        counts, bin_edges = np.histogram(divergence, bins=divergence_hist_bins)
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        bin_width = bin_edges[1] - bin_edges[0]
+
+        # Bars are colored by the phase probability of the bin center
+        bar_colors = create_colors_from_probabilities(
+            gmm.predict_proba(bin_centers.reshape(-1, 1)),
+            num_phases,
+            colours,
+            clip_range=clip_range,
+            saturation_boost=saturation_boost,
+        )
+        ax.bar(
+            bin_edges[:-1],
+            counts,
+            width=bin_width,
+            color=bar_colors,
+            align="edge",
+            edgecolor="none",
+            alpha=0.85,
+            zorder=2,
+        )
+
+        # Fitted components, scaled from probability density to counts
+        x_plot = np.linspace(bin_edges[0], bin_edges[-1], 500)
+        for k in range(num_phases):
+            mu_k = float(means[k, 0])
+            std_k = float(np.sqrt(max(covariances[k, 0, 0], 1e-12)))
+            curve = (
+                float(gmm.weights_[k])
+                * norm.pdf(x_plot, mu_k, std_k)
+                * divergence.size
+                * bin_width
+            )
+            ax.plot(
+                x_plot,
+                curve,
+                color=colours[k],
+                linewidth=2.5,
+                label=f"Phase {k}  (μ={mu_k:.3g}, σ={std_k:.3g})",
+                zorder=4,
+            )
+            ax.axvline(mu_k, color=colours[k], linestyle="--", linewidth=1.5, alpha=0.75, zorder=3)
+
+        ax.set_xlabel("Divergence (px)")
+        ax.set_ylabel("Count")
+        ax.set_title("Local polarization divergence — GMM decomposition")
+        ax.legend(loc="best")
+        return (fig, ax) if returnfig else None
+
+    if settings["spatial_average"]:
+        warnings.warn(
+            "Atoms are drawn at their measured polarization but colored by the spatially "
+            "averaged probabilities."
+        )
+
+    pol = lattice.polarization[0]
+    da = pol.select_fields("da").array[:, 0].astype(float)
+    db = pol.select_fields("db").array[:, 0].astype(float)
+    max_bound = float(max(np.abs(da).max(), np.abs(db).max())) or 0.01
+
+    # Kernel density estimate of the polarization
+    if da.size >= 2:
+        grid = np.linspace(-max_bound, max_bound, 100)
+        X, Y = np.meshgrid(grid, grid)
+        try:
+            Z = gaussian_kde(np.vstack((da, db)))(np.vstack((X.ravel(), Y.ravel())))
+            Z = Z.reshape(X.shape)
+            ax.contourf(X, Y, Z, levels=contour_levels, cmap=contour_cmap, alpha=0.9)
+            ax.contour(
+                X, Y, Z, levels=contour_levels, cmap=contour_cmap, linewidths=0.5, alpha=0.9
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            warnings.warn("Polarization density is degenerate. Contours are not drawn.")
+    else:
+        warnings.warn(f"Cannot estimate the density of {da.size} atom(s). Contours are not drawn.")
+
+    ax.scatter(
+        da,
+        db,
+        c=create_colors_from_probabilities(probabilities, num_phases, colours),
+        alpha=0.7,
+        s=20,
+        edgecolors="black",
+        linewidths=0.3,
+        zorder=7,
+    )
+
+    # GMM centers and confidence ellipses
+    if num_phases == 2:
+        preset_center, preset_ellipse = (0, 0.7, 0), (0, 0.7, 0)
+    elif num_phases < 5:
+        preset_center, preset_ellipse = "yellow", "yellow"
+    else:
+        preset_center, preset_ellipse = "black", "white"
+    gmm_center_colour = preset_center if gmm_center_colour is None else gmm_center_colour
+    gmm_ellipse_colour = preset_ellipse if gmm_ellipse_colour is None else gmm_ellipse_colour
+
+    ax.scatter(
+        means[:, 0],
+        means[:, 1],
+        c=[gmm_center_colour],
+        s=300,
+        marker="x",
+        linewidths=4,
+        alpha=0.8,
+        label="GMM Centers",
+        zorder=10,
+    )
+    for k in range(num_phases):
+        _plot_gaussian_ellipse(
+            ax,
+            means[k],
+            covariances[k],
+            n_std=n_std,
+            edgecolor=gmm_ellipse_colour,
+            linewidth=1.5,
+            alpha=0.6,
+            zorder=8,
+        )
+
+    ax.axhline(y=0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+    ax.axvline(x=0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+    ax.set_xlim(-max_bound, max_bound)
+    ax.set_ylim(-max_bound, max_bound)
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    ax.set_xlabel("da")
+    ax.set_ylabel("db")
+    ax.set_title("Classification & Contour Overlay")
+    ax.legend(loc="best")
+
+    if show_colorbar and num_phases in (2, 3):
+        divider = make_axes_locatable(ax)
+        if num_phases == 2:
+            add_2phase_colorbar(
+                divider.append_axes("right", size="4%", pad="4%"),
+                colours,
+                clip_range=clip_range,
+                saturation_boost=saturation_boost,
+            )
+        else:
+            add_3phase_color_triangle(
+                divider.append_axes("right", size="35%", pad="4%"),
+                colours,
+                clip_range=clip_range,
+                saturation_boost=saturation_boost,
+            )
+
+    return (fig, ax) if returnfig else None
+
+
+@_register("order_parameter")
+def plot_order_parameter(
+    lattice,
+    *,
+    returnfig: bool = False,
+    show_phase_references: bool = False,
+    phase_colours=None,
+    clip_range: tuple[float, float] | None = None,
+    saturation_boost: float = 1.0,
+    marker_size: float = 50.0,
+    marker_alpha: float = 0.8,
+    show_colorbar: bool = True,
+    reference_kwargs: dict | None = None,
+    **kwargs,
+) -> None | tuple:
+    """
+    Overlay the atoms colored by phase probability on the image.
+    Call after calculate_order_parameter().
+
+    With 2 phases the color goes from phase 0 through white (uncertain) to phase 1, and a
+    colorbar shows the order parameter p1 - p0. With 3 phases the colors are mixed and a
+    color triangle is shown. With more phases the phase colors are mixed by probability.
+
+    Parameters
+    ----------
+    returnfig : bool, default False
+        If True, return (fig, ax) instead of displaying.
+        With show_phase_references=True, ax is [ax_main, (ax_colorbar,) ax_phase_0, ...].
+    show_phase_references : bool, default False
+        If True, draw a unit cell diagram of the mean polarization of each phase next to the
+        map. Not available in the divergence mode.
+    phase_colours : callable | color | sequence of colors | NDArray | None
+        Color of each phase: a function i -> RGB, a single color for all phases, or
+        num_phases colors (names or an RGB array of shape (num_phases, 3)).
+        If None, site_colors is used.
+    clip_range : tuple[float, float] | None
+        Order parameter range mapped to full saturation (2 and 3 phases).
+    saturation_boost : float, default 1.0
+        Multiplier on the color saturation.
+    marker_size, marker_alpha : float
+        Size and transparency of the atom markers.
+    show_colorbar : bool, default True
+        If True, draw the 2-phase colorbar or 3-phase color triangle.
+    reference_kwargs : dict | None
+        Styling forwarded to the phase reference diagrams: atom_size, arrow_scale_factor,
+        adaptive_head, max_head_ratio, phase_arrow_headlength, phase_arrow_headwidth,
+        phase_arrow_tail_width, lattice_linewidth, reference_atom_colour, other_atom_colour,
+        lattice_line_colour, alpha_phase_atom, alpha_reference_atom, alpha_other_atom,
+        alpha_shadow_atom, alpha_phase_arrow, alpha_lattice_lines.
+    **kwargs forwarded to show_2d (e.g. cmap, title, figsize).
+    """
+    import warnings
+
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    _check_order_parameter(lattice)
+    settings = lattice._order_parameter_settings
+    num_phases = settings["num_phases"]
+    probabilities = lattice._order_parameter_probabilities
+    has_data = probabilities.shape[0] > 0
+    colours = _resolve_phase_colours(phase_colours, num_phases)
+
+    if show_phase_references and settings["spatial_divergence"]:
+        warnings.warn("Phase references are not available in the divergence mode.")
+        show_phase_references = False
+
+    draw_colorbar = show_colorbar and num_phases in (2, 3)
+    figsize = kwargs.pop("figsize", (14, 10) if show_phase_references else (10, 10))
+    show_title = "title" not in kwargs
+
+    ax_cbar = None
+    ref_axes = []
+    figax = None
+    if show_phase_references:
+        fig = plt.figure(figsize=figsize)
+        if num_phases == 2 and draw_colorbar:
+            outer = gridspec.GridSpec(1, 3, figure=fig, width_ratios=(10, 0.4, 4), wspace=0.15)
+            ax_cbar = fig.add_subplot(outer[0, 1])
+            ref_spec = outer[0, 2]
+        else:
+            outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=(10, 4), wspace=0.1)
+            ref_spec = outer[0, 1]
+        figax = (fig, fig.add_subplot(outer[0, 0]))
+
+        # With 3 phases the color triangle sits above the phase references
+        num_rows = num_phases + (1 if num_phases == 3 and draw_colorbar else 0)
+        inner = gridspec.GridSpecFromSubplotSpec(num_rows, 1, subplot_spec=ref_spec, hspace=0.25)
+        ref_axes = [fig.add_subplot(inner[i, 0]) for i in range(num_rows)]
+        if num_phases == 3 and draw_colorbar:
+            ax_cbar = ref_axes.pop(0)
+
+    fig, ax = show_2d(lattice._image.array, returnfig=True, figax=figax, figsize=figsize, **kwargs)
+    if ax.images:
+        ax.images[-1].set_zorder(0)
+
+    if has_data:
+        pol = lattice.polarization[0]
+        x = pol.select_fields("x").array[:, 0]
+        y = pol.select_fields("y").array[:, 0]
+        ax.scatter(
+            y,
+            x,
+            c=create_colors_from_probabilities(
+                probabilities,
+                num_phases,
+                colours,
+                clip_range=clip_range,
+                saturation_boost=saturation_boost,
+            ),
+            s=marker_size,
+            alpha=marker_alpha,
+            edgecolors="black",
+            linewidth=1,
+            zorder=11,
+        )
+
+    H, W = lattice._image.shape
+    ax.set_xlim(-0.5, W - 0.5)
+    ax.set_ylim(H - 0.5, -0.5)
+    if show_title:
+        ax.set_title("Spatial phase probability map")
+
+    if draw_colorbar:
+        if ax_cbar is None:
+            size = "4%" if num_phases == 2 else "35%"
+            ax_cbar = make_axes_locatable(ax).append_axes("right", size=size, pad="4%")
+        if num_phases == 2:
+            add_2phase_colorbar(
+                ax_cbar, colours, clip_range=clip_range, saturation_boost=saturation_boost
+            )
+        else:
+            add_3phase_color_triangle(
+                ax_cbar, colours, clip_range=clip_range, saturation_boost=saturation_boost
+            )
+
+    for phase_index, ax_ref in enumerate(ref_axes):
+        if has_data:
+            _plot_phase_reference(
+                lattice,
+                (fig, ax_ref),
+                phase_index,
+                colours[phase_index],
+                **(reference_kwargs or {}),
+            )
+        else:
+            ax_ref.axis("off")
+
+    if show_phase_references:
+        ax = [ax] + ([ax_cbar] if ax_cbar is not None else []) + ref_axes
+
+    return (fig, ax) if returnfig else None
+
+
 # --- Plotting Helper Functions ---
 def site_colors(number):
     """
@@ -758,6 +1150,406 @@ def _plot_polarization_legend(lattice, figax: tuple | None = None, **kwargs):
     ax.set_title("Atom Positions", fontsize=14, fontweight="bold")
 
     return fig, ax
+
+
+def _check_order_parameter(lattice) -> None:
+    """Raise if calculate_order_parameter() has not been run for the current polarization."""
+    if not hasattr(lattice, "_order_parameter_probabilities"):
+        raise ValueError(
+            "No order parameter to plot. Call `Lattice.calculate_order_parameter()` first."
+        )
+    cell = lattice.polarization[0].array
+    num_atoms = 0 if isinstance(cell, list) or cell is None else cell.shape[0]
+    if lattice._order_parameter_probabilities.shape[0] != num_atoms:
+        raise ValueError(
+            "The polarization has changed since the order parameter was calculated. "
+            "Call `Lattice.calculate_order_parameter()` again."
+        )
+
+
+def _resolve_phase_colours(phase_colours, num_phases: int) -> np.ndarray:
+    """
+    Convert phase_colours to an RGB array of shape (num_phases, 3).
+
+    Accepts None (site_colors), a function i -> RGB(A), a single color applied to every
+    phase, or a sequence / array of num_phases colors. Raises ValueError otherwise.
+    """
+    import matplotlib.colors as mcolors
+
+    if phase_colours is None:
+        phase_colours = site_colors
+    if callable(phase_colours):
+        return np.array([phase_colours(i)[:3] for i in range(num_phases)], dtype=float)
+
+    try:
+        return np.tile(mcolors.to_rgb(phase_colours), (num_phases, 1))
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        rgb = np.array([mcolors.to_rgb(c) for c in phase_colours], dtype=float)
+    except (ValueError, TypeError):
+        rgb = None
+    if rgb is None or rgb.shape != (num_phases, 3):
+        raise ValueError(
+            f"phase_colours must be a color, a function, or {num_phases} colors, "
+            f"got {phase_colours!r}."
+        )
+    return rgb
+
+
+def _plot_gaussian_ellipse(ax, mean, cov, n_std: float = 2.0, **kwargs):
+    """Draw the n_std confidence ellipse of a 2D Gaussian with the given mean and covariance."""
+    from matplotlib.patches import Ellipse
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+    width, height = 2 * n_std * np.sqrt(np.maximum(eigenvalues, 0.0))
+
+    ellipse = Ellipse(mean, width, height, angle=angle, fill=False, **kwargs)
+    ax.add_patch(ellipse)
+    return ellipse
+
+
+def _plot_phase_reference(
+    lattice,
+    figax: tuple,
+    phase_index: int,
+    phase_colour,
+    *,
+    atom_size: float = 100.0,
+    arrow_scale_factor: float = 2.0,
+    adaptive_head: bool = True,
+    max_head_ratio: float = 3.5,
+    phase_arrow_headlength: float = 8.0,
+    phase_arrow_headwidth: float = 8.0,
+    phase_arrow_tail_width: float = 3.0,
+    lattice_linewidth: float = 1.0,
+    reference_atom_colour=None,
+    other_atom_colour=None,
+    lattice_line_colour=None,
+    alpha_phase_atom: float = 1.0,
+    alpha_reference_atom: float = 1.0,
+    alpha_other_atom: float = 1.0,
+    alpha_shadow_atom: float = 0.2,
+    alpha_phase_arrow: float = 1.0,
+    alpha_lattice_lines: float = 0.3,
+):
+    """
+    Unit cell diagram of the mean polarization of one phase.
+
+    The measured atom is drawn displaced along the phase mean (scaled by arrow_scale_factor),
+    with a faint shadow at its ideal position, an arrow between them, the reference neighbours,
+    the other sites, and the lattice lines of the surrounding unit cell.
+    """
+    import matplotlib.colors as mcolors
+    from matplotlib.patches import ArrowStyle, FancyArrowPatch
+
+    fig, ax = figax
+    reference_rgb = np.array(mcolors.to_rgb(reference_atom_colour or site_colors(-1)))
+    other_rgb = np.array(mcolors.to_rgb(other_atom_colour or site_colors(-2)))
+    line_rgb = np.array(mcolors.to_rgb(lattice_line_colour or site_colors(-1)))
+    phase_rgb = np.array(mcolors.to_rgb(phase_colour))
+
+    _, u, v = (np.asarray(x, dtype=float) for x in lattice._lat)
+    A = np.column_stack((u, v))
+    phase_vector = np.asarray(lattice._polarization_means[phase_index], dtype=float)
+    measure_ind, reference_ind = lattice._pol_meas_ref_ind
+    frac_positions = np.asarray(lattice._positions_frac, dtype=float)
+    corner_ind = np.array([[i, j] for i in [1.0, 0.0, -1.0] for j in [1.0, 0.0, -1.0]])
+
+    def tile(ind: np.ndarray) -> np.ndarray:
+        return (ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+
+    def within_unit_cell(ind: np.ndarray) -> np.ndarray:
+        return ind[np.max(np.abs(ind), axis=1) <= 1.0 + 1e-9]
+
+    # Fractional positions of each atom group within one unit cell of the measured atom
+    reference_frac = within_unit_cell(lattice._most_common_neighbours.reshape(-1, 2))
+    measured_frac = within_unit_cell(tile(np.zeros((1, 2))))
+    is_origin = np.all(np.abs(measured_frac) < 1e-6, axis=1)
+    other_measured_frac = measured_frac[~is_origin]
+    shadow_frac = measured_frac[is_origin]
+    tip_frac = (phase_vector * arrow_scale_factor).reshape(1, 2)
+
+    indices = np.arange(len(frac_positions))
+    other_frac = frac_positions[(indices != measure_ind) & (indices != reference_ind)]
+    if other_frac.size > 0:
+        # Offsets of up to 2 cells so that every image within one cell is found
+        other_frac = np.unique(within_unit_cell(tile(tile(other_frac))), axis=0)
+    else:
+        other_frac = np.zeros((0, 2))
+
+    # Lattice lines between atoms that share a u or v index of -1, 0 or 1
+    all_frac = np.vstack((reference_frac, shadow_frac, tip_frac, other_measured_frac, other_frac))
+    all_pos = all_frac @ A.T
+    drawn_lines = set()
+    for i in range(len(all_frac)):
+        for j in range(i + 1, len(all_frac)):
+            same_u = abs(all_frac[i, 0] - all_frac[j, 0]) < 1e-6
+            same_v = abs(all_frac[i, 1] - all_frac[j, 1]) < 1e-6
+            on_u_line = same_u and np.any(
+                np.abs(all_frac[i, 0] - np.array([1.0, 0.0, -1.0])) < 1e-6
+            )
+            on_v_line = same_v and np.any(
+                np.abs(all_frac[i, 1] - np.array([1.0, 0.0, -1.0])) < 1e-6
+            )
+            if not (on_u_line or on_v_line):
+                continue
+            line_id = tuple(sorted((tuple(all_pos[i]), tuple(all_pos[j]))))
+            if line_id in drawn_lines:
+                continue
+            drawn_lines.add(line_id)
+            ax.plot(
+                [all_pos[i, 1], all_pos[j, 1]],
+                [all_pos[i, 0], all_pos[j, 0]],
+                linestyle="-",
+                linewidth=lattice_linewidth,
+                color=line_rgb,
+                alpha=alpha_lattice_lines,
+                zorder=1,
+            )
+
+    # Atoms
+    for frac, colour, alpha, zorder in (
+        (other_frac, other_rgb, alpha_other_atom, 5),
+        (reference_frac, reference_rgb, alpha_reference_atom, 6),
+        (shadow_frac, phase_rgb, alpha_shadow_atom, 4),
+        (other_measured_frac, phase_rgb, alpha_phase_atom, 7),
+        (tip_frac, phase_rgb, alpha_phase_atom, 7),
+    ):
+        if len(frac) > 0:
+            fig, ax = plot_atoms_2d(
+                frac @ A.T,
+                site_number=phase_index,
+                figax=(fig, ax),
+                size=atom_size,
+                alpha=alpha,
+                zorder=zorder,
+                color_override=colour,
+            )
+
+    # Arrow from the ideal position to the displaced atom
+    pol_vector = phase_vector @ A.T
+    if adaptive_head:
+        arrow_length = float(np.linalg.norm(pol_vector))
+        headlength = max(min(phase_arrow_headlength, arrow_length * max_head_ratio), 0.5)
+        headwidth = max(min(phase_arrow_headwidth, arrow_length * max_head_ratio), 0.5)
+    else:
+        headlength, headwidth = phase_arrow_headlength, phase_arrow_headwidth
+    arrow = FancyArrowPatch(
+        (0, 0),
+        (pol_vector[1] * arrow_scale_factor, pol_vector[0] * arrow_scale_factor),
+        arrowstyle=ArrowStyle.Simple(
+            head_length=headlength, head_width=headwidth, tail_width=phase_arrow_tail_width
+        ),
+        mutation_scale=1.0,
+        facecolor=phase_rgb,
+        edgecolor=reference_rgb,
+        alpha=alpha_phase_arrow,
+        zorder=8,
+        capstyle="round",
+        joinstyle="round",
+        shrinkA=0.0,
+        shrinkB=0.0,
+    )
+    ax.add_patch(arrow)
+
+    # Formatting: 10% padding around the atoms
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    x_pad, y_pad = 0.1 * (xlim[1] - xlim[0]), 0.1 * (ylim[1] - ylim[0])
+    ax.set_xlim(xlim[0] - x_pad, xlim[1] + x_pad)
+    ax.set_ylim(ylim[0] - y_pad, ylim[1] + y_pad)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.invert_yaxis()
+    ax.set_title(f"Phase {phase_index}", fontsize=14, fontweight="bold")
+
+    return fig, ax
+
+
+def create_colors_from_probabilities(
+    probabilities,
+    num_phases,
+    category_colors=None,
+    clip_range=None,
+    saturation_boost=1.0,
+):
+    """
+    Colors of atoms from their phase probabilities.
+
+    - 2 phases: the order parameter OP = p1 - p0 is mapped from phase 0 (OP = -1) through white
+      (OP = 0) to phase 1 (OP = +1). clip_range limits the OP range mapped to full saturation.
+    - 3 phases: the phase colors are mixed by probability and faded to white with a smooth
+      function of the certainty max(p). clip_range limits the certainty range.
+    - Otherwise: the phase colors are mixed by probability.
+
+    Parameters
+    ----------
+    probabilities : NDArray, shape (N, num_phases)
+        Probabilities of each phase (rows sum to 1).
+    num_phases : int
+        Number of phases.
+    category_colors : NDArray | None, shape (num_phases, 3)
+        RGB colors of the phases. If None, site_colors is used.
+    clip_range : tuple[float, float] | None
+        See above.
+    saturation_boost : float, default 1.0
+        Multiplier on the saturation.
+
+    Returns
+    -------
+    colors : NDArray, shape (N, 3)
+    """
+    import matplotlib.colors as mcolors
+
+    probabilities = np.asarray(probabilities, dtype=float).reshape(-1, num_phases)
+    if category_colors is None:
+        category_colors = np.array([site_colors(i) for i in range(num_phases)], dtype=float)
+    mixed_colors = probabilities @ np.asarray(category_colors, dtype=float)
+
+    if num_phases == 2:
+        op = probabilities[:, 1] - probabilities[:, 0]
+        if clip_range is not None:
+            clip_min, clip_max = clip_range
+            op_normalized = (np.clip(op, clip_min, clip_max) - clip_min) / (clip_max - clip_min)
+        else:
+            op_normalized = (op + 1.0) / 2.0
+        # 0 at OP = 0 (uncertain), 1 at the edges of the range
+        certainty = np.abs(op_normalized - 0.5) * 2.0
+    elif num_phases == 3:
+        certainty = np.max(probabilities, axis=1)
+        if clip_range is not None:
+            clip_min, clip_max = clip_range
+            mid_point = (clip_min + clip_max) / 2.0
+            certainty = np.abs(np.clip(certainty, clip_min, clip_max) - mid_point) / (
+                np.abs(clip_max - clip_min) / 2.0
+            )
+        certainty = 3 * certainty**2 - 2 * certainty**3
+    else:
+        certainty = None
+
+    if certainty is None:
+        final_colors = np.clip(mixed_colors, 0, 1)
+        saturation_scale = np.full(len(final_colors), saturation_boost)
+    else:
+        # Blend with white: uncertain -> white, certain -> phase color
+        final_colors = np.clip(
+            certainty[:, None] * mixed_colors + (1 - certainty[:, None]) * np.ones(3), 0, 1
+        )
+        saturation_scale = certainty * saturation_boost
+
+    hsv_colors = mcolors.rgb_to_hsv(final_colors)
+    hsv_colors[:, 1] = np.clip(hsv_colors[:, 1] * saturation_scale, 0, 1)
+
+    return np.clip(mcolors.hsv_to_rgb(hsv_colors), 0, 1)
+
+
+def add_2phase_colorbar(
+    ax_cbar, scatter_colours, match_ax=None, clip_range=None, saturation_boost=1.0
+):
+    """
+    Draw the 2-phase order parameter colorbar on ax_cbar.
+
+    The colormap goes from phase 0 (OP = -1, bottom) through white (OP = 0) to phase 1
+    (OP = +1, top), where OP = p1 - p0. If clip_range is given, only that range is labeled.
+    If match_ax is given, the colorbar is aligned to its height.
+    """
+    import matplotlib.colors as mcolors
+    from matplotlib.colors import LinearSegmentedColormap
+
+    color0, color1 = np.asarray(scatter_colours[0]), np.asarray(scatter_colours[1])
+    if saturation_boost != 1.0:
+        hsv = mcolors.rgb_to_hsv(np.array([color0, color1], dtype=float))
+        hsv[:, 1] = np.clip(hsv[:, 1] * saturation_boost, 0, 1)
+        color0, color1 = mcolors.hsv_to_rgb(hsv)
+
+    cmap = LinearSegmentedColormap.from_list("two_phase", [color0, (1, 1, 1), color1], N=256)
+    gradient = np.linspace(0, 1, 256).reshape(256, 1)
+    ax_cbar.imshow(gradient, aspect="auto", cmap=cmap, origin="lower")
+
+    if match_ax is not None:
+        pos_match = match_ax.get_position()
+        pos_cbar = ax_cbar.get_position()
+        ax_cbar.set_position([pos_cbar.x0, pos_match.y0, pos_cbar.width, pos_match.height])
+
+    if clip_range is not None:
+        clip_min, clip_max = clip_range
+        span = clip_max - clip_min
+        if span < 0.3:
+            tick_vals = [clip_min, (clip_min + clip_max) / 2.0, clip_max]
+        elif span < 1.0:
+            step = 0.2 if span >= 0.4 else 0.1
+            tick_vals = np.arange(clip_min, clip_max + step / 2, step)
+        else:
+            tick_vals = clip_min + span * np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        tick_pixels = [int((val - clip_min) / span * 255) for val in tick_vals]
+        tick_labels = [f"{val:.2g}" for val in tick_vals]
+    else:
+        tick_pixels = [0, 64, 128, 192, 255]
+        tick_labels = ["-1", "-0.5", "0", "+0.5", "+1"]
+
+    ax_cbar.set_xticks([])
+    ax_cbar.set_yticks(tick_pixels)
+    ax_cbar.set_yticklabels(tick_labels)
+    ax_cbar.yaxis.tick_right()
+    ax_cbar.set_ylabel("Order Parameter", rotation=270, labelpad=14)
+    ax_cbar.yaxis.set_label_position("right")
+
+    return ax_cbar
+
+
+def add_3phase_color_triangle(
+    ax_triangle, scatter_colours, match_ax=None, clip_range=None, saturation_boost=1.0
+):
+    """
+    Draw the 3-phase ternary color triangle on ax_triangle, with phase 0 at the bottom left,
+    phase 1 at the bottom right and phase 2 at the top. clip_range and saturation_boost are
+    passed to create_colors_from_probabilities. If match_ax is given, the top of the triangle
+    is aligned with its top.
+    """
+    resolution = 100
+    probabilities, positions = [], []
+    for i in range(resolution + 1):
+        for j in range(resolution + 1 - i):
+            p0, p1, p2 = i / resolution, j / resolution, (resolution - i - j) / resolution
+            probabilities.append([p0, p1, p2])
+            positions.append([0.5 * (2 * p1 + p2), (np.sqrt(3) / 2) * p2])
+    positions = np.array(positions)
+
+    colors = create_colors_from_probabilities(
+        np.array(probabilities),
+        3,
+        scatter_colours,
+        clip_range=clip_range,
+        saturation_boost=saturation_boost,
+    )
+    ax_triangle.scatter(
+        positions[:, 0], positions[:, 1], c=colors, s=20, marker="s", edgecolors="none"
+    )
+
+    vertices = np.array([[0, 0], [1, 0], [0.5, np.sqrt(3) / 2], [0, 0]])
+    ax_triangle.plot(vertices[:, 0], vertices[:, 1], "k-", linewidth=2)
+    for k, (vx, vy) in enumerate(vertices[:3]):
+        ax_triangle.scatter(
+            vx, vy, s=150, c=[scatter_colours[k]], edgecolors="black", linewidths=2, zorder=10
+        )
+        text_y, va = (vy + 0.1, "bottom") if k == 2 else (vy - 0.1, "top")
+        ax_triangle.text(
+            vx, text_y, f"Phase {k}", ha="center", va=va, fontsize=10, fontweight="bold"
+        )
+
+    ax_triangle.set_aspect("equal")
+    ax_triangle.axis("off")
+
+    if match_ax is not None:
+        pos_match = match_ax.get_position()
+        pos_tri = ax_triangle.get_position()
+        ax_triangle.set_position(
+            [pos_tri.x0, pos_match.y1 - pos_tri.height, pos_tri.width, pos_tri.height]
+        )
+
+    return ax_triangle
 
 
 def plot_atoms_2d(
