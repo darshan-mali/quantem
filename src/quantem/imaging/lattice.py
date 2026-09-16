@@ -1229,6 +1229,8 @@ class Lattice(AutoSerialize):
         reference_ind : int
             Index of the reference site used to infer the expected positions.
             This is the row index into the `positions_frac` passed to add_atoms().
+            May equal `measure_ind` to measure the lattice distortion of a single site; each
+            atom is then excluded from its own reference neighbours.
         reference_radius : float | None, default None
             If provided, the reference neighbours of a measured atom are all reference atoms within
             this radius (in pixels), truncated to the closest `max_neighbours` if that is also given.
@@ -1290,6 +1292,8 @@ class Lattice(AutoSerialize):
               r_expected = mean_i( r_i + L @ [a - a_i, b - b_i] )
           and the polarization is
               [da, db] = L^{-1} @ (r - r_expected).
+        - If `measure_ind == reference_ind`, the measured atom itself is never one of its reference
+          neighbours, so the polarization is the local lattice distortion of that site.
         """
         from collections import Counter
 
@@ -1308,6 +1312,8 @@ class Lattice(AutoSerialize):
         for name, ind in (("measure_ind", measure_ind), ("reference_ind", reference_ind)):
             if not 0 <= ind < self._num_sites:
                 raise ValueError(f"{name} must be between 0 and {self._num_sites - 1}, got {ind}.")
+        # Measuring a site against itself: each atom must be excluded from its own neighbours
+        same_site = measure_ind == reference_ind
 
         # VALIDATION: Neighbour search parameters
         if reference_radius is None and max_neighbours is None:
@@ -1380,6 +1386,8 @@ class Lattice(AutoSerialize):
             neighbour_lists = tree.query_ball_point(query_coords, r=reference_radius, workers=-1)
             for i, neighbours in enumerate(neighbour_lists):
                 neighbours = np.asarray(neighbours, dtype=int)
+                if same_site:
+                    neighbours = neighbours[neighbours != i]
                 distances = np.linalg.norm(ref_coords[neighbours] - query_coords[i], axis=1)
                 sorted_idx = neighbours[np.argsort(distances)]
                 if max_neighbours is not None:
@@ -1392,10 +1400,16 @@ class Lattice(AutoSerialize):
                     "Failed to calculate enough nearest neighbours. Increase the reference_radius"
                 )
         else:
-            dist_array, idx_array = tree.query(query_coords, k=max_neighbours, workers=-1)
+            # Query one extra neighbour for a same-site measurement, as the atom finds itself
+            k = max_neighbours + 1 if same_site else max_neighbours
+            dist_array, idx_array = tree.query(query_coords, k=k, workers=-1)
             # Missing neighbours (fewer reference atoms than k) are returned with infinite distance
             finite_mask = np.isfinite(dist_array)
             neighbour_idxs = [idx_array[i][finite_mask[i]] for i in range(len(query_coords))]
+            if same_site:
+                neighbour_idxs = [
+                    idx[idx != i][:max_neighbours] for i, idx in enumerate(neighbour_idxs)
+                ]
 
         # NEIGHBOUR CHECKING
         lengths = np.array([len(idx) for idx in neighbour_idxs])

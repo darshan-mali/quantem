@@ -687,6 +687,54 @@ class TestMeasurePolarization:
         assert lattice_with_atoms.polarization[0].array.shape == (0, 6)
         assert lattice_with_atoms.default_plot == "polarization"
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"reference_radius": 50.0},
+            {"reference_radius": None, "max_neighbours": 4},
+        ],
+    )
+    def test_same_site_ideal_lattice_zero(self, lattice_with_atoms: Lattice, kwargs):
+        """Measuring a site against itself on an ideal lattice gives zero distortion."""
+        lattice_with_atoms.measure_polarization(measure_ind=0, reference_ind=0, **kwargs)
+        pol = lattice_with_atoms.polarization[0]
+
+        assert lattice_with_atoms._pol_meas_ref_ind == (0, 0)
+        assert np.allclose(pol.select_fields("da").array, 0.0)
+        assert np.allclose(pol.select_fields("db").array, 0.0)
+        # The atom itself (offset (0, 0)) is never one of its reference neighbours
+        offsets = lattice_with_atoms._most_common_neighbours
+        assert offsets.shape[0] > 0
+        assert not np.any(np.all(offsets == 0.0, axis=1))
+
+    def test_same_site_excludes_self(self, lattice_with_atoms: Lattice):
+        """A displaced atom measured against its own site recovers its full displacement."""
+        fields = lattice_with_atoms.atoms.fields
+        ix, iy = fields.index("x"), fields.index("y")
+        arr = lattice_with_atoms.atoms[0].array.copy()
+        target = np.argmin(np.hypot(arr[:, ix] - 95.0, arr[:, iy] - 95.0))
+        shift_px = 2.0
+        arr[target, ix] += shift_px
+        lattice_with_atoms.atoms[0] = arr
+
+        lattice_with_atoms.measure_polarization(
+            measure_ind=0, reference_ind=0, reference_radius=None, max_neighbours=4
+        )
+        pol = lattice_with_atoms.polarization[0]
+        da = pol.select_fields("da").array[:, 0]
+        db = pol.select_fields("db").array[:, 0]
+
+        # Including the atom in its own reference would give 3/4 of the shift
+        assert np.isclose(da[target], shift_px / 40.0)
+        assert np.isclose(db[target], 0.0)
+
+    def test_same_site_radius_too_small_raises(self, lattice_with_atoms: Lattice):
+        """A radius that only contains the atom itself raises."""
+        with pytest.raises(ValueError, match=r"Increase the reference_radius"):
+            lattice_with_atoms.measure_polarization(
+                measure_ind=0, reference_ind=0, reference_radius=30.0
+            )
+
 
 class TestMeasurePolarizationSynGT:
     """
@@ -818,6 +866,17 @@ class TestPlotPolarization:
 
         fig, axs = lattice.plot(kind="polarization", show_legend=True, returnfig=True)
         assert isinstance(fig, Figure)
+
+    def test_plot_legend_same_site(self):
+        """Test the legend after measuring a site against itself."""
+        lattice = _grid_lattice_with_atoms()
+        lattice.measure_polarization(
+            measure_ind=0, reference_ind=0, reference_radius=None, max_neighbours=8
+        )
+
+        fig, axs = lattice.plot(kind="polarization", show_legend=True, returnfig=True)
+        assert isinstance(fig, Figure)
+        assert len(axs) == 3
 
     def test_plot_empty_polarization(self, lattice_with_polarization: Lattice):
         """Test plotting with an empty polarization."""

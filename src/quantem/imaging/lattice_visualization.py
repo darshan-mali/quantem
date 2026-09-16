@@ -680,6 +680,15 @@ def _plot_polarization_legend(lattice, figax: tuple | None = None, **kwargs):
     other_atom_ind = other_atom_ind[
         np.where(np.linalg.norm(other_atom_ind @ A.T, axis=1) < max_dist)
     ]
+    # Same-site measurement: tiled measured atoms coincide with the reference neighbours
+    if measure_ind == reference_ind:
+        is_ref = np.any(
+            np.all(
+                np.isclose(measured_atom_ind[:, None, :], reference_atom_ind[None, :, :]), axis=2
+            ),
+            axis=1,
+        )
+        measured_atom_ind = measured_atom_ind[~is_ref]
 
     # Convert to Cartesian coordinates
     reference_atom_pos = reference_atom_ind @ A.T
