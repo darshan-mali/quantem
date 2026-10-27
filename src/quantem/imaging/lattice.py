@@ -1,6 +1,7 @@
 import inspect
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
 
@@ -750,6 +751,7 @@ class Lattice(AutoSerialize):
             shape=(self._num_sites,),
             fields=["x", "y", "a", "b", "int_peak"],
             units=["px", "px", "ind", "ind", "counts"],
+            dtype=torch.float64,
         )
 
         # Iterate over each site in the unit cell
@@ -1049,15 +1051,15 @@ class Lattice(AutoSerialize):
 
         for s in range(self._num_sites):
             # Get the atom data for this site
-            row = self.atoms[s].array
+            row = self.atoms[s].numpy()
 
             # Skip if no atoms exist for this site
-            if isinstance(row, list) or row is None or row.size == 0:
+            if row.size == 0:
                 continue
 
             # Extract x and y coordinates for all atoms at this site
-            x_arr = self.atoms[s].select_fields("x").array[:, 0]
-            y_arr = self.atoms[s].select_fields("y").array[:, 0]
+            x_arr = self.atoms[s].select_fields("x").numpy()[:, 0]
+            y_arr = self.atoms[s].select_fields("y").numpy()[:, 0]
 
             # Create a copy of the atom data to accumulate refinements
             updated = row.copy()

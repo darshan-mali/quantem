@@ -510,15 +510,15 @@ class TestLatticeAtomsSynGT:
         for site_idx, (da, db) in enumerate(data["positions_frac"]):
             site_atoms = lattice.atoms[site_idx]
 
-            if isinstance(site_atoms.array, list) or site_atoms.array.size == 0:
+            if site_atoms.numpy().size == 0:
                 continue
 
             # Fetching all the data for all atoms of one site
             # [:,0] simply converts (N,1) shape array to (N,) array
-            x_arr = site_atoms.select_fields("x").array[:, 0]
-            y_arr = site_atoms.select_fields("y").array[:, 0]
-            a_arr = site_atoms.select_fields("a").array[:, 0]
-            b_arr = site_atoms.select_fields("b").array[:, 0]
+            x_arr = site_atoms.select_fields("x").numpy()[:, 0]
+            y_arr = site_atoms.select_fields("y").numpy()[:, 0]
+            a_arr = site_atoms.select_fields("a").numpy()[:, 0]
+            b_arr = site_atoms.select_fields("b").numpy()[:, 0]
 
             for x_fit, y_fit, a_val, b_val in zip(x_arr, y_arr, a_arr, b_arr):
                 a_int = int(round(a_val - da))

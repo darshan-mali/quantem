@@ -174,11 +174,11 @@ def plot_atoms(lattice, *, returnfig: bool = False, **kwargs) -> None | tuple:
     H, W = lattice._image.shape
 
     for s in range(lattice._num_sites):
-        cell = lattice.atoms[s].array
-        if isinstance(cell, list) or cell is None or cell.size == 0:
+        cell = lattice.atoms[s].numpy()
+        if cell.size == 0:
             continue
-        x = lattice.atoms[s].select_fields("x").array[:, 0]
-        y = lattice.atoms[s].select_fields("y").array[:, 0]
+        x = lattice.atoms[s].select_fields("x").numpy()[:, 0]
+        y = lattice.atoms[s].select_fields("y").numpy()[:, 0]
         rgb = site_colors(int(lattice._numbers[s]))
         ax.scatter(
             y,
